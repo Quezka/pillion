@@ -1,0 +1,8 @@
+target/
+android/build/
+*.apk
+*.jks
+*.keystore
+keystore.properties
+.test-phone/
+shots/

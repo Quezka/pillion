@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="channel_riding">В поездке</string>
+    <string name="running_title">Pillion едет с вами</string>
+    <string name="running_text">Держит связь с мопедом и голос включёнными при выключенном экране.</string>
+    <string name="stop">Стоп</string>
+</resources>

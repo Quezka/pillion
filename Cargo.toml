@@ -1,0 +1,31 @@
+[package]
+name = "pillion"
+version = "0.1.0"
+edition = "2021"
+description = "Riding companion for an electric moped: battery, consumption, navigation, dash notifications and a listen-only voice mode"
+
+[lib]
+name = "pillion"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "pillion"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+resvg = { version = "0.47", default-features = false }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "android-native-activity"] }
+jni = "0.21"
+winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+strip = true

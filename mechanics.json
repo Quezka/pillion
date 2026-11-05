@@ -1,0 +1,403 @@
+{
+  "version": 1,
+  "values": [
+    {
+      "name": "BLE service",
+      "group": "bluetooth",
+      "value": "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+      "source": "kg.j.a"
+    },
+    {
+      "name": "BLE write characteristic",
+      "group": "bluetooth",
+      "value": "6e400002-b5a3-f393-e0a9-e50e24dcca9e",
+      "source": "kg.j.b"
+    },
+    {
+      "name": "BLE notify characteristic",
+      "group": "bluetooth",
+      "value": "6e400003-b5a3-f393-e0a9-e50e24dcca9e",
+      "source": "kg.j.c"
+    },
+    {
+      "name": "device names",
+      "group": "bluetooth",
+      "value": "YSCCU, YCCU",
+      "source": "dg.g.b"
+    },
+    {
+      "name": "requested MTU",
+      "group": "bluetooth",
+      "value": 512,
+      "unit": "bytes",
+      "source": "YSCCUService.d"
+    },
+    {
+      "name": "write spacing",
+      "group": "bluetooth",
+      "value": 100,
+      "unit": "ms",
+      "source": "YSCCUService.a1"
+    },
+    {
+      "name": "connection timeout",
+      "group": "bluetooth",
+      "value": 15,
+      "unit": "s",
+      "source": "YSCCUService.p1"
+    },
+    {
+      "name": "clock and flags period",
+      "group": "bluetooth",
+      "value": 1,
+      "unit": "s",
+      "source": "YSCCUService.v"
+    },
+    {
+      "name": "flags delay after clock",
+      "group": "bluetooth",
+      "value": 100,
+      "unit": "ms",
+      "source": "YSCCUService.v1"
+    },
+    {
+      "name": "QR code length",
+      "group": "pairing",
+      "value": 24,
+      "unit": "characters",
+      "source": "dg.e.a"
+    },
+    {
+      "name": "QR order",
+      "group": "pairing",
+      "value": "7 14 20 0 12 17 6 22 2 13 10 1 16 19 8 21 23 5 15 3 9 18 4 11",
+      "source": "Ldg/e;-><clinit>()V array payload"
+    },
+    {
+      "name": "CCU-ID length",
+      "group": "pairing",
+      "value": 14,
+      "unit": "characters",
+      "source": "ev.LocalId0x7F00"
+    },
+    {
+      "name": "passkey length",
+      "group": "pairing",
+      "value": 6,
+      "unit": "characters",
+      "source": "ev.LocalId0x7F00"
+    },
+    {
+      "name": "battery percent mask",
+      "group": "battery",
+      "value": 127,
+      "source": "MessageId0x56_CAN;->getBatteryRemain1()I offset 000e"
+    },
+    {
+      "name": "low battery threshold",
+      "group": "battery",
+      "value": 50,
+      "unit": "%",
+      "source": "MessageId0x56_CAN.getBatteryLowFlg1"
+    },
+    {
+      "name": "battery temperature offset",
+      "group": "battery",
+      "value": 40,
+      "source": "MessageId0x56_CAN.getBattery1TemperatureMax"
+    },
+    {
+      "name": "battery temperature scale",
+      "group": "battery",
+      "value": 0.5,
+      "unit": "deg C",
+      "source": "MessageId0x56_CAN.getBattery1TemperatureMax"
+    },
+    {
+      "name": "pack voltage scale",
+      "group": "battery",
+      "value": 0.5,
+      "unit": "V",
+      "source": "MessageId0x56_CAN.getTotalBattery1Voltage"
+    },
+    {
+      "name": "current scale",
+      "group": "battery",
+      "value": 10,
+      "unit": "mA",
+      "source": "MessageId0x56_CAN.getCurrent1"
+    },
+    {
+      "name": "capacity scale",
+      "group": "battery",
+      "value": 0.1,
+      "unit": "Ah",
+      "source": "MessageId0x56_CAN.getRemainingCapacity1"
+    },
+    {
+      "name": "odometer scale",
+      "group": "vehicle",
+      "value": 100,
+      "unit": "m",
+      "source": "MessageId0x56_CAN;->getODO()I offset 000a"
+    },
+    {
+      "name": "motor speed offset",
+      "group": "vehicle",
+      "value": 32768,
+      "unit": "rpm",
+      "source": "MessageId0x56_CAN.getMotorSpeed"
+    },
+    {
+      "name": "motor temperature offset",
+      "group": "vehicle",
+      "value": 20,
+      "unit": "deg C",
+      "source": "MessageId0x56_CAN.getMotorTemperature"
+    },
+    {
+      "name": "main switch on value",
+      "group": "vehicle",
+      "value": 2,
+      "source": "service.g.K2"
+    },
+    {
+      "name": "default efficiency",
+      "group": "consumption",
+      "value": 30,
+      "unit": "km/kWh",
+      "source": "ug.e screen update; service.g line 1383"
+    },
+    {
+      "name": "minimum valid efficiency",
+      "group": "consumption",
+      "value": 5,
+      "unit": "km/kWh",
+      "source": "ug.e screen update; service.g line 1465"
+    },
+    {
+      "name": "average pack voltage",
+      "group": "consumption",
+      "value": 50,
+      "unit": "V",
+      "source": "EVConfig.json avgVoltage"
+    },
+    {
+      "name": "charging base time",
+      "group": "consumption",
+      "value": 8,
+      "unit": "h",
+      "source": "ug.e.<init> f=8; Lcom/yamaha/myride/helper/b2;->b(IIIF)F"
+    },
+    {
+      "name": "charging model factor",
+      "group": "consumption",
+      "value": 1.125,
+      "source": "EVConfig.json chargingTime.soh for BFM models; this moped's model code unconfirmed"
+    },
+    {
+      "name": "efficiency bands",
+      "group": "consumption",
+      "value": "20, 30, 40, 50",
+      "unit": "km/kWh",
+      "source": "EVConfig.json revsDb, stored but not used by the app or this build"
+    },
+    {
+      "name": "distance before measured average efficiency is used",
+      "group": "consumption",
+      "value": 2,
+      "unit": "km",
+      "estimated": true
+    },
+    {
+      "name": "battery announcement step",
+      "group": "voice",
+      "value": 10,
+      "unit": "%",
+      "estimated": true
+    },
+    {
+      "name": "battery announcement step when low",
+      "group": "voice",
+      "value": 5,
+      "unit": "%",
+      "estimated": true
+    },
+    {
+      "name": "low battery voice threshold",
+      "group": "voice",
+      "value": 20,
+      "unit": "%",
+      "estimated": true
+    },
+    {
+      "name": "consumption announcement distance",
+      "group": "voice",
+      "value": 5,
+      "unit": "km",
+      "estimated": true
+    },
+    {
+      "name": "early turn announcement",
+      "group": "navigation",
+      "value": 300,
+      "unit": "m",
+      "estimated": true
+    },
+    {
+      "name": "final turn announcement",
+      "group": "navigation",
+      "value": 60,
+      "unit": "m",
+      "estimated": true
+    },
+    {
+      "name": "off-route distance",
+      "group": "navigation",
+      "value": 50,
+      "unit": "m",
+      "estimated": true
+    },
+    {
+      "name": "off-route fixes before rerouting",
+      "group": "navigation",
+      "value": 5,
+      "estimated": true
+    },
+    {
+      "name": "route top speed",
+      "group": "navigation",
+      "value": 45,
+      "unit": "km/h",
+      "estimated": true
+    },
+    {
+      "name": "background colour",
+      "group": "style",
+      "value": "#111119",
+      "source": "suite-kit quezka_ui/theme.py DARK.bg"
+    },
+    {
+      "name": "battery colour",
+      "group": "style",
+      "value": "#9a9bff",
+      "source": "suite-kit quezka_ui/theme.py DARK.accent"
+    },
+    {
+      "name": "nearby road search when a destination is unreachable",
+      "group": "navigation",
+      "value": 300,
+      "unit": "m",
+      "estimated": true
+    },
+    {
+      "name": "ride ends after switch off or link down",
+      "group": "rides",
+      "value": 5,
+      "unit": "s",
+      "source": "service.g.w1"
+    },
+    {
+      "name": "ride end check period",
+      "group": "rides",
+      "value": 1,
+      "unit": "s",
+      "source": "service.g.w1 timer"
+    },
+    {
+      "name": "nominal capacity for full range",
+      "group": "consumption",
+      "value": 20.0,
+      "unit": "Ah",
+      "source": "ug.e screen update"
+    },
+    {
+      "name": "range withheld at or below, one battery",
+      "group": "consumption",
+      "value": 15,
+      "unit": "%",
+      "source": "ug.e screen update"
+    },
+    {
+      "name": "range withheld at or below, two batteries combined",
+      "group": "consumption",
+      "value": 30,
+      "unit": "%",
+      "source": "ug.e screen update"
+    },
+    {
+      "name": "range withheld while output limited",
+      "group": "consumption",
+      "value": true,
+      "source": "ug.e screen update; MessageId0x56_CAN;->getOutputLimit()I"
+    },
+    {
+      "name": "fault codes never reported",
+      "group": "faults",
+      "value": "C111, C110, 0B25, 0D22, 0000",
+      "source": "ug.e.<init> field h; Lug/e;->o(Ljava/util/List;I)Ljava/lang/String;"
+    },
+    {
+      "name": "faults need warning value not 0",
+      "group": "faults",
+      "value": true,
+      "source": "Lug/e;->o(Ljava/util/List;I)Ljava/lang/String; offset 0002"
+    },
+    {
+      "name": "light theme accent",
+      "group": "style",
+      "value": "#4b4bc8",
+      "source": "suite-kit quezka_ui/theme.py LIGHT.accent"
+    },
+    {
+      "name": "card radius",
+      "group": "style",
+      "value": 16,
+      "unit": "px",
+      "source": "suite-kit quezka_ui/theme.py material #card"
+    },
+    {
+      "name": "typeface",
+      "group": "style",
+      "value": "Manrope",
+      "source": "suite-kit quezka_ui/assets"
+    },
+    {
+      "name": "languages",
+      "group": "style",
+      "value": "English, Italian, Russian",
+      "source": "claude-memory app-style-guide, Localisation"
+    },
+    {
+      "name": "notifications from one app counted as one",
+      "group": "voice",
+      "value": 15,
+      "unit": "s",
+      "estimated": true
+    },
+    {
+      "name": "recent places kept",
+      "group": "navigation",
+      "value": 5,
+      "estimated": true
+    },
+    {
+      "name": "ringing that stops sends missed call flag",
+      "group": "dash",
+      "value": true,
+      "source": "Lag/h;->a(I)V offset 000b; MessageId0xA6_Local0x058B.notifyStatusCheck"
+    },
+    {
+      "name": "incoming call off flag ever sent",
+      "group": "dash",
+      "value": false,
+      "source": "MessageId0xA6_Local0x058B.notifyStatusCheck"
+    },
+    {
+      "name": "call lights on by default",
+      "group": "dash",
+      "value": true,
+      "estimated": true
+    }
+  ]
+}

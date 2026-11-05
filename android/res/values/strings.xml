@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="channel_riding">Riding</string>
+    <string name="running_title">Pillion is riding along</string>
+    <string name="running_text">Keeps the moped connected and the voice on with the screen off.</string>
+    <string name="stop">Stop</string>
+</resources>

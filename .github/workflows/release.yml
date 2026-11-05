@@ -1,0 +1,61 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  NDK_VERSION: "27.2.12479018"
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Check the tag matches the app version
+        run: |
+          v=$(grep -m1 -oP '^version = "\K[^"]+' Cargo.toml)
+          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != version $v"; exit 1; }
+      - name: Install the Android tools
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;$NDK_VERSION" > /dev/null
+          rustup target add aarch64-linux-android x86_64-linux-android
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Test
+        run: cargo test --lib
+      - name: Decode the signing key
+        env:
+          PILLION_KEYSTORE_B64: ${{ secrets.PILLION_KEYSTORE_B64 }}
+        run: echo "$PILLION_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/pillion.jks"
+      - name: Build the signed APK
+        env:
+          PILLION_KEYSTORE: ${{ runner.temp }}/pillion.jks
+          PILLION_KEYSTORE_PASSWORD: ${{ secrets.PILLION_KEYSTORE_PASSWORD }}
+        run: bash android/build_android.sh
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cp Pillion.apk "Pillion-$version.apk"
+          python3 - "$version" <<'PY' > notes.md
+          import re, sys
+          text = open('CHANGELOG.md', encoding='utf-8').read()
+          m = re.search(r'^## \[' + re.escape(sys.argv[1]) + r'\][^\n]*\n(.*?)(?=^## \[|\Z)', text, re.S | re.M)
+          print(m.group(1).strip() if m else '')
+          PY
+          gh release create "$GITHUB_REF_NAME" "Pillion-$version.apk" --title "Pillion $version" --notes-file notes.md

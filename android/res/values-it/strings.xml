@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="channel_riding">In viaggio</string>
+    <string name="running_title">Pillion viaggia con te</string>
+    <string name="running_text">Tiene collegato il motorino e attiva la voce anche a schermo spento.</string>
+    <string name="stop">Ferma</string>
+</resources>
