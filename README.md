@@ -28,5 +28,7 @@ The logic is Rust (`src/`), the same on the desktop and the phone, and the Andro
 Bump `version` in `Cargo.toml`, add a `CHANGELOG.md` section, then push a tag `vX.Y.Z`. CI tests, builds and publishes the signed APK.
 
 Phones only accept updates signed with the same key, so never lose it or regenerate it. It isn't in this repository. CI holds it as
-the secrets `PILLION_KEYSTORE_B64` and `PILLION_KEYSTORE_PASSWORD`. A local build reads it from `android/pillion.jks` and
-`android/keystore.properties`, both git-ignored.
+the secrets `PILLION_KEYSTORE_B64` and `PILLION_KEYSTORE_PASSWORD`, and there's a copy in the private `quezka/pillion-signing` on
+git.lan. A local build reads it from `android/pillion.jks` and `android/keystore.properties`, both git-ignored.
+
+`tools/publish.sh` does the first publish: the git.lan backups, then the GitHub repo and its secrets, then the tag.
