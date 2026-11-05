@@ -10,9 +10,12 @@ LAN_CODE=quezka/pillion
 LAN_SIGNING=quezka/pillion-signing
 TAG="v$(grep -m1 -oP '^version = "\K[^"]+' Cargo.toml)"
 
-# What someone who isn't signed in sees. Gitea answers 404 for a private repo.
+# What someone who isn't signed in sees: 404 for a private repo, or the login page when the whole server needs signing in.
 is_hidden() {
-    [ "$(curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$LAN_HOST/$1")" = "404" ]
+    case "$(curl -s -o /dev/null -m 10 -w '%{http_code} %{redirect_url}' "http://$LAN_HOST/$1")" in
+        404\ *|303\ */user/login*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # ---- git.lan ----
