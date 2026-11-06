@@ -43,6 +43,7 @@ jobs:
         run: echo "$PILLION_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/pillion.jks"
       - name: Build the signed APK
         env:
+          PILLION_ARM_ONLY: "1"
           PILLION_KEYSTORE: ${{ runner.temp }}/pillion.jks
           PILLION_KEYSTORE_PASSWORD: ${{ secrets.PILLION_KEYSTORE_PASSWORD }}
         run: bash android/build_android.sh

@@ -1,5 +1,6 @@
 target/
 android/build/
+android/third_party/
 *.apk
 *.jks
 *.keystore

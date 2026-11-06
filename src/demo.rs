@@ -4,9 +4,27 @@
 use crate::engine::Engine;
 use crate::locale::{t, tf};
 use crate::nav::{LatLon, Maneuver, Route};
-use crate::protocol::{build_live_frame, Live, Pack};
+use crate::protocol::{build_live_frame, BatteryRecord, Live, Pack, Vehicle};
 
 const STEP_S: f64 = 0.5;
+
+/// Invented records, so that the demo shows what a real moped reports.
+pub fn records() -> (Vehicle, [BatteryRecord; 2]) {
+    let record = |id, charges, normal, discharged_ah, started: &str| BatteryRecord {
+        id,
+        charges,
+        normal_charges: normal,
+        slow_charges: charges - normal,
+        discharged_ah,
+        started: started.to_string(),
+        ..BatteryRecord::default()
+    };
+    (
+        Vehicle { vin: "DEMO0000000000000".to_string(), software: 1042, times_on: 812 },
+        [record(1, 143, 140, 2480, "2024-03-19"), record(2, 61, 60, 1040, "2025-01-27")],
+    )
+}
+
 const SPEED_MPS: f64 = 8.3;
 pub const START_ALONG_M: f64 = 650.0;
 const STOP_BEFORE_END_M: f64 = 80.0;
@@ -35,6 +53,7 @@ fn maneuver(kind: u32, begin: usize, text: &str, street: &str) -> Maneuver {
         spoken_before: full,
         spoken_at: tf("{}.", &[&text]),
         begin,
+        ..Default::default()
     }
 }
 
@@ -111,6 +130,29 @@ impl DemoRide {
             remaining_ah: remaining,
             full_ah: FULL_AH,
             health: 96,
+            cell_max_v: Some(3.65),
+            cell_min_v: Some(3.62),
+            limit_discharge_a: 60,
+            limit_charge_a: 10.0,
+            ..Pack::default()
+        };
+        // A second battery, still full and waiting its turn.
+        live.packs[1] = Pack {
+            fitted: true,
+            percent: 100,
+            low: false,
+            voltage: 52.0,
+            current_ma: 0,
+            temp_max: 24.0,
+            temp_min: 22.5,
+            remaining_ah: FULL_AH,
+            full_ah: FULL_AH,
+            health: 98,
+            cell_max_v: Some(3.65),
+            cell_min_v: Some(3.62),
+            limit_discharge_a: 60,
+            limit_charge_a: 10.0,
+            ..Pack::default()
         };
         live
     }

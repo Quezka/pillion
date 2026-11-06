@@ -3,7 +3,7 @@
 #[cfg(not(target_os = "android"))]
 fn main() -> eframe::Result {
     use eframe::egui;
-    use pillion::engine::Engine;
+    use pillion::engine::{Appearance, Engine};
     use pillion::ui::CompanionApp;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -13,9 +13,14 @@ fn main() -> eframe::Result {
 
     let mut args = std::env::args().skip(1);
     let mut screenshot = None;
+    let mut tab = None;
+    let mut appearance = None;
     while let Some(arg) = args.next() {
-        if arg == "--screenshot" {
-            screenshot = args.next();
+        match arg.as_str() {
+            "--screenshot" => screenshot = args.next(),
+            "--tab" => tab = args.next(),
+            "--appearance" => appearance = args.next(),
+            _ => {}
         }
     }
 
@@ -28,6 +33,11 @@ fn main() -> eframe::Result {
     let engine = Arc::new(Mutex::new(Engine::new()));
     if let Ok(mut e) = engine.lock() {
         e.start_demo();
+        match appearance.as_deref() {
+            Some("light") => e.settings.appearance = Appearance::Light,
+            Some("dark") => e.settings.appearance = Appearance::Dark,
+            _ => {}
+        }
     }
     let ticking = Arc::clone(&engine);
     std::thread::spawn(move || {
@@ -53,7 +63,13 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Pillion",
         options,
-        Box::new(move |_cc| Ok(Box::new(CompanionApp::new(engine, screenshot)))),
+        Box::new(move |_cc| {
+            let mut app = CompanionApp::new(engine, screenshot);
+            if let Some(tab) = &tab {
+                app.open_tab(tab);
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 

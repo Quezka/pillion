@@ -23,6 +23,8 @@ Checked instruction by instruction:
 | `ev/MessageId0x56_CAN;->getBatteryRemain1()I`, mask at 000e | classes3 | ev_1c70be13... |
 | `ev/MessageId0x56_CAN;->getODO()I`, times 100 at 000a | classes3 | ev_42def6c8... |
 | `ev/MessageId0x56_CAN;->getOutputLimit()I`, bit 1 at 0006 | classes3 | ev_0c99c165... |
+| `ev/MessageId0x55_Local0x0028;->getTotalDischargeCapacity()I`, times 5 at 000a | classes3 | ev_8450ffb8... |
+| `ev/MessageId0x56_CAN;->getAPSOpening()I`, raw value at 000a | classes3 | ev_d5e82bef... |
 | `Ldg/e;-><clinit>()V` QR table | classes3 | ev_6a468804... |
 | `Lug/e;->o(Ljava/util/List;I)Ljava/lang/String;` fault filter | classes3 | ev_f3741190... |
 | `Lag/h;->a(I)V` call state, change test at 000b | classes3 | ev_4e523c8a... |
@@ -127,6 +129,14 @@ service start), bonding flag 1 byte. First connection of a run: real values, fla
 - The `disconnect` value and efficiency bands (`revsDb.electricityCost1..4`) are stored in table `ev_config`, but no
   code in the app reads them for a decision, so the build doesn't use them.
 
+### Two batteries
+
+Each battery has its own groups: `0450` and `0470` for the first, `0451` and `0471` for the second, and one byte each in `0340`
+for whether it's fitted (`MessageId0x56_CAN`). Range adds the two, and the withheld-range rule above changes with how many are
+fitted. The original shows each battery on its own; the combined percent on our Ride screen and in the voice is ours, weighted by each
+battery's full capacity (estimated). Which battery the moped drains first is decided on the moped and isn't in the app. A battery
+going in or out during a ride starts a new ride (ours), so it never counts as energy used or gained.
+
 ### Rides (`service.g.w1`, `service.g.h`, `service.g.K2`)
 
 - A ride starts when the moped sends group `0028` (`service.g.h`). It marks the main switch on. We start one when the live
@@ -183,6 +193,63 @@ We use free OpenStreetMap services: Valhalla (`motor_scooter` costing, top speed
 for routes and spoken directions, Nominatim for address search. Announcement distances, voice phrasing
 and off-route rules are ours and marked `estimated` in `mechanics.json`. Places a scooter can't enter,
 such as palace grounds, come back as "no path"; the app then asks again, accepting roads within 300 m.
+
+## The 3D moped
+
+`src/model3d.rs` models the rider's moped in code and draws it with its own small renderer, so the app needs no model file or
+graphics library. MyRide has no 3D model. The side outlines are traced from the rider's side photo at 470 pixels to the metre,
+which agrees with the 13 inch wheels and a seat about 0.79 m high. Widths are judged from their front and three-quarter photos, so
+they are less exact. It leaves out badges and lettering. `examples/model_shot.rs` draws it to a picture for comparing with photos.
+The batteries' place and size under the seat are estimated: no photo shows the seat open.
+
+## Other things the moped sends (`MessageId0x5B_CommonRecords`, `MessageId0x55_Local0x0028`, `MessageId0x56_CAN`)
+
+The phone only ever sends login, clock and dash flags: there's no message for horn, lock, lights or riding mode anywhere in the
+electric message set, so the app can't control the moped. The moped sends all the rest by itself (`lg.d.h`, `lg.d.k`).
+
+| Start, group | Offset:length | Field | Rule | Source method |
+|---|---|---|---|---|
+| 0x5B F190 | 0:17 | Frame number | text | `getVehicleVin` |
+| 0x5B F194 | 0:4 | Software number | raw | `getECUSoftwareVersion` |
+| 0x5B F1A1 | 0:4 | Total powered time | raw, unit unknown, not shown | `getECUElectrifyTotalTime` |
+| 0x5B F1A2 | 0:2 | Times switched on | raw | `getECUIgnitionTotalCount` |
+| 0x5B F701 | 0:16 | Four energy totals | raw, unit unknown, not shown | `getAccumulatePowerConsume1` |
+| 0x55 0028 | 8:2 | Total discharged | `raw * 5`, read but not shown as its unit is unknown | `getTotalDischargeCapacity` |
+| 0x55 0028 | 12:2 | Charges | raw | `getTotalChargeCount` |
+| 0x55 0028 | 14:2, 16:2, 18:2 | Fast, normal, slow charges | raw | `getFastChargeCount` |
+| 0x55 0028 | 38:2 | Battery id | raw | `getBatteryIdentifyID` |
+| 0x55 0028 | 40:3 | First use | hex digits; reading them as YY MM DD is estimated | `getBatteryStartDate` |
+| 0x56 0459, 045A | 0:2, 2:2 | Highest, lowest cell | see below | `getCellVoltageMax1` |
+| 0x56 0459, 045A | 4:1, 5:1 | Discharge limit, charge limit | raw A, `raw * 0.5` A | `getCurrentLimitDischarge1` |
+| 0x56 0480, 0481 | 2:2 | Battery fault code | raw, read but not used yet | `getAbnormalCode1` |
+| 0x56 0220 | 7:1 | Throttle | raw % | `getAPSOpening` |
+
+The original never converts the cell readings. Its long-term record scales the single-byte form by 5/256, so we try 5/65536 for
+two bytes, then millivolts, and show nothing unless the result looks like a cell (2.0 to 4.6 V). This scale is estimated. The Moped
+tab can record what the moped sends and share it as text, to settle these on real data. A recording holds the frame number.
+
+## How the navigation speaks and draws
+
+Valhalla's route answers are used for the wording. Turn warnings go by time, 24 s and 5 s ahead, within 150 to 350 m and 30 to 70 m
+(all estimated), or 300 m and 60 m with no speed known. A joined turn (`verbal_multi_cue`) is told together with the one before it. After a
+turn with over 1.5 km to the next, its `verbal_post_transition_instruction` is spoken. A new route keeps the rider's direction with
+`heading` when moving above 7 km/h. Search prefers places within about 0.3 by 0.2 degrees of the rider, but isn't limited to them.
+The map's pictures come from tile.openstreetmap.org and are kept for 7 days, as its usage policy asks, with the credit on the map.
+
+## Updates (not from the original)
+
+Once a day, or when asked, the app reads `api.github.com/repos/Quezka/pillion/releases/latest` without logging in, so **the repository and its releases
+have to be public** for this to work. A newer `vX.Y.Z` tag with an `.apk` is offered, never installed unasked, and not mentioned on the Ride tab while riding.
+The file is checked against GitHub's SHA-256 when it gives one, must be this package with a higher version code, and goes to Android's own installer. Android
+asks the rider to confirm, and refuses any file not signed with the installed app's key. So a release must be built with `android/pillion.jks`.
+
+## The natural voice
+
+The voices are Piper models run offline by sherpa-onnx 1.13.8. Version 2 removed espeak-ng, which turns these voices' words into sounds.
+They're downloaded only when the rider asks, from `csukuangfj/vits-piper-*` on Hugging Face, and the model is checked against its SHA-256.
+Voices: `en_GB-alba-medium` (CC BY 4.0), `it_IT-paola-medium` (licence: see its dataset's page), `ru_RU-irina-medium` (its model card says
+unknown). **espeak-ng is GPL 3**, and it's inside the engine library that ships in the APK, so anyone given the APK is owed its source under those terms.
+Until a voice is there, the app uses Android's speech and picks its best installed voice for the language.
 
 ## The suite's look
 

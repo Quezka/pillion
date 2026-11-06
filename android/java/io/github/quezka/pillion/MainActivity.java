@@ -9,6 +9,8 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.text.InputType;
+import android.view.HapticFeedbackConstants;
 import android.view.WindowManager;
 import android.widget.EditText;
 import java.util.ArrayList;
@@ -24,10 +26,20 @@ public class MainActivity extends NativeActivity {
         super.onCreate(saved);
         current = this;
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        // Draw up into the camera's corner too, instead of leaving a black band across the top.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            WindowManager.LayoutParams attributes = getWindow().getAttributes();
+            attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            getWindow().setAttributes(attributes);
+        }
         // The drawing surface runs under Android's bars, so the app needs to know how much room to leave.
         getWindow().getDecorView().setOnApplyWindowInsetsListener((view, insets) -> {
+            int top = insets.getSystemWindowInsetTop();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && insets.getDisplayCutout() != null) {
+                top = Math.max(top, insets.getDisplayCutout().getSafeInsetTop());
+            }
             Native.event("insets",
-                    String.valueOf(insets.getSystemWindowInsetTop()),
+                    String.valueOf(top),
                     String.valueOf(insets.getSystemWindowInsetBottom()));
             return insets;
         });
@@ -90,6 +102,27 @@ public class MainActivity extends NativeActivity {
         startForegroundService(new Intent(this, RideService.class));
     }
 
+    /** A small tick, so a tap can be felt with gloves on. */
+    static void haptic() {
+        MainActivity activity = current;
+        if (activity != null) {
+            activity.getWindow().getDecorView().performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+        }
+    }
+
+    /** Opens the camera to read the moped's QR sticker. */
+    static void scanQr(String title, String torch, String typeIt, String cancel) {
+        MainActivity activity = current;
+        if (activity == null) {
+            return;
+        }
+        activity.runOnUiThread(() -> activity.startActivity(new Intent(activity, QrScan.class)
+                .putExtra(QrScan.TITLE, title)
+                .putExtra(QrScan.TORCH, torch)
+                .putExtra(QrScan.TYPE_IT, typeIt)
+                .putExtra(QrScan.CANCEL, cancel)));
+    }
+
     /** A QR reader app usually copies what it reads, which saves typing 24 characters by hand. */
     private static String pairingCodeOnClipboard(MainActivity activity) {
         ClipboardManager clipboard = activity.getSystemService(ClipboardManager.class);
@@ -102,7 +135,7 @@ public class MainActivity extends NativeActivity {
     }
 
     /** Asks for text with Android's own dialog, since its keyboard can't type into the Rust window. */
-    static void askText(String key, String title, String hint) {
+    static void askText(String key, String title, String hint, boolean dark) {
         MainActivity activity = current;
         if (activity == null) {
             return;
@@ -113,8 +146,14 @@ public class MainActivity extends NativeActivity {
             input.setSingleLine(true);
             if ("pair".equals(key)) {
                 input.setText(pairingCodeOnClipboard(activity));
+                input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                        | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+            } else {
+                input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
             }
-            AlertDialog dialog = new AlertDialog.Builder(activity, android.R.style.Theme_Material_Dialog_Alert)
+            AlertDialog dialog = new AlertDialog.Builder(activity, dark
+                    ? android.R.style.Theme_DeviceDefault_Dialog_Alert
+                    : android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
                     .setTitle(title)
                     .setView(input)
                     .setPositiveButton("OK", (d, w) -> Native.event("text", key, input.getText().toString()))

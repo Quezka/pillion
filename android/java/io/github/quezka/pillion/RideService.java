@@ -34,6 +34,8 @@ import android.provider.Settings;
 import android.telephony.TelephonyManager;
 import android.view.KeyEvent;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
@@ -54,6 +56,8 @@ public class RideService extends Service {
     private static final long GPS_INTERVAL_MS = 1000;
     private static final float GPS_MIN_METRES = 1f;
     private static final int HTTP_TIMEOUT_MS = 15000;
+    private static final long TILE_KEEP_MS = 7L * 24 * 60 * 60 * 1000;
+    private final ExecutorService tiles = Executors.newFixedThreadPool(2);
     private static final String USER_AGENT = "Pillion/0.1 (personal riding app)";
     private static final int SILENCE_RATE_HZ = 8000;
 
@@ -312,7 +316,34 @@ public class RideService extends Service {
                 fetch(f[1], "search_ok", "search_err", null);
                 break;
             case "ask":
-                MainActivity.askText(f[1], f[2], f[3]);
+                MainActivity.askText(f[1], f[2], f[3], "1".equals(f[4]));
+                break;
+            case "haptic":
+                MainActivity.haptic();
+                break;
+            case "update_check":
+                fetch(f[1], "update_ok", "update_err", null);
+                break;
+            case "update_install":
+                Updater.install(this, f[1], f[2]);
+                break;
+            case "scan_qr":
+                MainActivity.scanQr(f[1], f[2], f[3], f[4]);
+                break;
+            case "voice_download":
+                voice.downloadPack();
+                break;
+            case "voice_remove":
+                voice.removePack();
+                break;
+            case "voice_natural":
+                voice.setNaturalWanted("1".equals(f[1]));
+                break;
+            case "tile":
+                fetchTile(f[1], f[2], f[3]);
+                break;
+            case "share":
+                share(f[1]);
                 break;
             case "notif_access":
                 open(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
@@ -333,6 +364,48 @@ public class RideService extends Service {
             default:
                 break;
         }
+    }
+
+    /** Map pictures are kept for a week, as the map's provider asks, and so that riding the same way costs no data. */
+    private void fetchTile(String z, String x, String y) {
+        tiles.execute(() -> {
+            File folder = new File(getCacheDir(), "tiles");
+            File file = new File(folder, z + "_" + x + "_" + y + ".png");
+            if (file.length() > 0 && System.currentTimeMillis() - file.lastModified() < TILE_KEEP_MS) {
+                Native.event("tile", z, x, y, file.getPath());
+                return;
+            }
+            File partial = new File(folder, file.getName() + ".part");
+            try {
+                if (!folder.isDirectory() && !folder.mkdirs()) {
+                    throw new IOException("No room for the map");
+                }
+                HttpURLConnection connection = (HttpURLConnection) new URL(
+                        "https://tile.openstreetmap.org/" + z + "/" + x + "/" + y + ".png").openConnection();
+                connection.setConnectTimeout(10_000);
+                connection.setReadTimeout(15_000);
+                connection.setRequestProperty("User-Agent", USER_AGENT);
+                try (InputStream in = connection.getInputStream(); FileOutputStream out = new FileOutputStream(partial)) {
+                    byte[] buffer = new byte[16 * 1024];
+                    for (int read = in.read(buffer); read >= 0; read = in.read(buffer)) {
+                        out.write(buffer, 0, read);
+                    }
+                } finally {
+                    connection.disconnect();
+                }
+                if (!partial.renameTo(file)) {
+                    throw new IOException("The map couldn't be saved");
+                }
+                Native.event("tile", z, x, y, file.getPath());
+            } catch (IOException failed) {
+                Native.event("tile_failed", z, x, y);
+            }
+        });
+    }
+
+    private void share(String text) {
+        Intent send = new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text);
+        open(Intent.createChooser(send, null));
     }
 
     private void fetch(String url, String okEvent, String errorEvent, String destination) {

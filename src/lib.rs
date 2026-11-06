@@ -3,11 +3,15 @@
 pub mod demo;
 pub mod engine;
 pub mod locale;
+pub mod m3;
+pub mod model3d;
 pub mod nav;
 pub mod protocol;
+pub mod qr;
 mod symbols;
 pub mod theme;
 pub mod ui;
+pub mod update;
 
 #[cfg(target_os = "android")]
 mod android;
@@ -22,8 +26,11 @@ use engine::{Command, Engine};
 pub fn desktop_prompts(engine: &mut Engine) -> Vec<(String, String)> {
     let mut prompts = Vec::new();
     while let Some(command) = engine.poll_command() {
-        if let Command::AskText { key, title, .. } = command {
-            prompts.push((key, title));
+        match command {
+            Command::AskText { key, title, .. } => prompts.push((key, title)),
+            // There's no camera on the preview, so the code gets typed.
+            Command::ScanQr { title, .. } => prompts.push(("pair".to_string(), title)),
+            _ => {}
         }
     }
     prompts

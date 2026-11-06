@@ -8,6 +8,8 @@ pub const DEVICE_NAMES: [&str; 2] = ["YSCCU", "YCCU"];
 pub const START_LOGIN: u8 = 0xAA;
 pub const START_LOGIN_RESULT: u8 = 0x5A;
 pub const START_LIVE: u8 = 0x56;
+pub const START_BATTERY_RECORD: u8 = 0x55;
+pub const START_COMMON_RECORDS: u8 = 0x5B;
 pub const START_TO_DASH: u8 = 0xA6;
 pub const GROUP_LOGIN: u16 = 0x7F00;
 pub const GROUP_LOGIN_RESULT: u16 = 0x7F01;
@@ -226,6 +228,12 @@ pub struct Pack {
     pub remaining_ah: f32,
     pub full_ah: f32,
     pub health: u8,
+    /// Its highest and lowest cell, when the reading makes sense as a voltage.
+    pub cell_max_v: Option<f32>,
+    pub cell_min_v: Option<f32>,
+    pub limit_discharge_a: u8,
+    pub limit_charge_a: f32,
+    pub abnormal_code: u16,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -244,13 +252,46 @@ pub struct Live {
     pub vehicle_errors: Vec<u16>,
     pub controller_errors: Vec<u16>,
     pub speed_pulse: u8,
+    /// How far the throttle is open, in percent.
+    pub throttle: u8,
+}
+
+/// A battery's own long-term record, which the moped sends by itself.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BatteryRecord {
+    pub id: u16,
+    pub charges: u16,
+    pub fast_charges: u16,
+    pub normal_charges: u16,
+    pub slow_charges: u16,
+    pub discharged_ah: u32,
+    pub started: String,
+}
+
+/// What the moped says about itself.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Vehicle {
+    pub vin: String,
+    pub software: u32,
+    pub times_on: u16,
 }
 
 const LIVE_PACK_GROUPS: [(u16, u16); 2] = [(0x0450, 0x0470), (0x0451, 0x0471)];
+/// Each battery's cell voltages and limits, then its manager's state.
+const LIVE_CELL_GROUPS: [(u16, u16); 2] = [(0x0459, 0x0480), (0x045A, 0x0481)];
 const MAIN_SWITCH_ON: u32 = 2;
 /// Fault codes the original deliberately doesn't report.
 const IGNORED_FAULT_CODES: [u16; 5] = [0xC111, 0xC110, 0x0B25, 0x0D22, 0x0000];
 const LOW_FLAG_BELOW: u8 = 50;
+
+/// The original never converts these two bytes. Its long-term record scales one byte of the same reading by 5/256, so this
+/// tries the same scale over two bytes, then millivolts, and otherwise admits it doesn't know.
+fn cell_volts(raw: u32) -> Option<f32> {
+    const CELL_RANGE: std::ops::RangeInclusive<f32> = 2.0..=4.6;
+    let scaled = raw as f32 * 5.0 / 65536.0;
+    let millivolts = raw as f32 / 1000.0;
+    [scaled, millivolts].into_iter().find(|v| CELL_RANGE.contains(v))
+}
 
 fn error_codes(frame: &Frame, id: u16) -> Vec<u16> {
     (0..4)
@@ -294,7 +335,14 @@ pub fn parse_live(frame: &Frame) -> Option<Live> {
             remaining_ah: frame.uint(capacity, 0, 1) as f32 * 0.1,
             full_ah: frame.uint(capacity, 1, 1) as f32 * 0.1,
             health: frame.uint(capacity, 4, 1) as u8,
+            ..Pack::default()
         };
+        let (cells, manager) = LIVE_CELL_GROUPS[i];
+        packs[i].cell_max_v = cell_volts(frame.uint(cells, 0, 2));
+        packs[i].cell_min_v = cell_volts(frame.uint(cells, 2, 2));
+        packs[i].limit_discharge_a = frame.uint(cells, 4, 1) as u8;
+        packs[i].limit_charge_a = frame.uint(cells, 5, 1) as f32 * 0.5;
+        packs[i].abnormal_code = frame.uint(manager, 2, 2) as u16;
     }
     Some(Live {
         packs,
@@ -311,7 +359,60 @@ pub fn parse_live(frame: &Frame) -> Option<Live> {
         vehicle_errors: error_codes(frame, 0x0323),
         controller_errors: error_codes(frame, 0x0252),
         speed_pulse: frame.uint(0x0329, 0, 1) as u8,
+        throttle: frame.uint(0x0220, 7, 1) as u8,
     })
+}
+
+const GROUP_BATTERY_RECORD: u16 = 0x0028;
+
+pub fn parse_battery_record(frame: &Frame) -> Option<BatteryRecord> {
+    if frame.start != START_BATTERY_RECORD {
+        return None;
+    }
+    let data = frame.group(GROUP_BATTERY_RECORD)?;
+    let field = |offset: usize| frame.uint(GROUP_BATTERY_RECORD, offset, 2);
+    let started = data.get(40..43).map_or(String::new(), |d| format!("20{:02X}-{:02X}-{:02X}", d[0], d[1], d[2]));
+    Some(BatteryRecord {
+        id: field(38) as u16,
+        charges: field(12) as u16,
+        fast_charges: field(14) as u16,
+        normal_charges: field(16) as u16,
+        slow_charges: field(18) as u16,
+        discharged_ah: field(8) * 5,
+        started,
+    })
+}
+
+pub fn parse_vehicle(frame: &Frame) -> Option<Vehicle> {
+    if frame.start != START_COMMON_RECORDS {
+        return None;
+    }
+    let vin = String::from_utf8_lossy(frame.group(0xF190)?);
+    Some(Vehicle {
+        vin: vin.trim_matches(|c: char| c == '\0' || c.is_whitespace()).to_string(),
+        software: frame.uint(0xF194, 0, 4),
+        times_on: frame.uint(0xF1A2, 0, 2) as u16,
+    })
+}
+
+/// The moped's own records, as it would send them. For the demo ride and the tests.
+pub fn build_records_frames(vehicle: &Vehicle, record: &BatteryRecord, counter: u8) -> [Vec<u8>; 2] {
+    let mut common = vec![(0xF190u16, vehicle.vin.as_bytes().to_vec())];
+    common.push((0xF194, vehicle.software.to_be_bytes().to_vec()));
+    common.push((0xF1A2, vehicle.times_on.to_be_bytes().to_vec()));
+    let mut data = vec![0u8; 50];
+    let mut put = |offset: usize, value: u16| data[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+    put(8, (record.discharged_ah / 5) as u16);
+    put(12, record.charges);
+    put(14, record.fast_charges);
+    put(16, record.normal_charges);
+    put(18, record.slow_charges);
+    put(38, record.id);
+    let date: Vec<u8> = record.started.trim_start_matches("20").split('-').filter_map(|p| u8::from_str_radix(p, 16).ok()).collect();
+    if date.len() == 3 {
+        data[40..43].copy_from_slice(&date);
+    }
+    [build_frame(START_COMMON_RECORDS, &common, counter), build_frame(START_BATTERY_RECORD, &[(GROUP_BATTERY_RECORD, data)], counter)]
 }
 
 /// Encodes live data the way the moped does. The demo ride goes through the same parser as a real
@@ -338,6 +439,15 @@ pub fn build_live_frame(live: &Live, counter: u8) -> Vec<u8> {
         ));
         groups.push((capacity, vec![scaled(p.remaining_ah, 0.1), scaled(p.full_ah, 0.1), 0, 0, p.health, 0]));
     }
+    for (i, (cells, manager)) in LIVE_CELL_GROUPS.into_iter().enumerate() {
+        let p = &live.packs[i];
+        let raw = |v: Option<f32>| (v.unwrap_or(0.0) * 65536.0 / 5.0).round() as u16;
+        let (high, low) = (raw(p.cell_max_v).to_be_bytes(), raw(p.cell_min_v).to_be_bytes());
+        groups.push((cells, vec![high[0], high[1], low[0], low[1], p.limit_discharge_a, scaled(p.limit_charge_a, 0.5), 0, 0]));
+        let code = p.abnormal_code.to_be_bytes();
+        groups.push((manager, vec![0, 0, code[0], code[1], 0, 0, 0, 0]));
+    }
+    groups.push((0x0220, vec![0, 0, 0, 0, 0, 0, 0, live.throttle]));
     let odo = (live.odometer_m / 100).to_be_bytes();
     let switch = if live.switched_on { MAIN_SWITCH_ON as u8 } else { 0 };
     groups.push((0x0230, vec![odo[1], odo[2], odo[3], 0, switch, live.model_number, 0, 0]));
@@ -509,10 +619,11 @@ mod tests {
             remaining_ah: 9.7,
             full_ah: 23.1,
             health: 96,
+            ..Pack::default()
         };
         let bytes = build_live_frame(&live, 9);
         let frame = Frame::parse(&bytes).unwrap();
-        assert_eq!(frame.groups.len(), 13);
+        assert_eq!(frame.groups.len(), 18);
         let parsed = parse_live(&frame).unwrap();
         assert!((parsed.motor_temp - live.motor_temp).abs() < 0.05);
         assert!((parsed.controller_temp - live.controller_temp).abs() < 0.05);
@@ -536,6 +647,34 @@ mod tests {
         assert!(live.active_faults().is_empty());
         live.warning = 1;
         assert_eq!(live.active_faults(), vec![0x0A12, 0x0B26]);
+    }
+
+    #[test]
+    fn second_battery_is_read_from_its_own_groups() {
+        let mut live = Live::default();
+        live.packs[1] = Pack {
+            fitted: true,
+            percent: 77,
+            low: false,
+            voltage: 52.0,
+            current_ma: 500,
+            temp_max: 20.0,
+            temp_min: 18.0,
+            remaining_ah: 17.3,
+            full_ah: 22.0,
+            health: 90,
+            ..Pack::default()
+        };
+        let parsed = parse_live(&Frame::parse(&build_live_frame(&live, 0)).unwrap()).unwrap();
+        assert!(!parsed.packs[0].fitted);
+        assert_eq!(parsed.packs[0].percent, 0);
+        assert!(parsed.packs[1].fitted);
+        assert_eq!(parsed.packs[1].percent, 77);
+        assert_eq!(parsed.packs[1].voltage, 52.0);
+        assert_eq!(parsed.packs[1].current_ma, 500);
+        assert!((parsed.packs[1].remaining_ah - 17.3).abs() < 0.05);
+        assert!((parsed.packs[1].full_ah - 22.0).abs() < 0.05);
+        assert_eq!(parsed.packs[1].health, 90);
     }
 
     #[test]
@@ -572,5 +711,32 @@ mod tests {
         assert_eq!(from_hex(&to_hex(&[0, 171, 255])).unwrap(), vec![0, 171, 255]);
         assert!(from_hex("abc").is_none());
         assert!(from_hex("zz").is_none());
+    }
+
+    #[test]
+    fn reads_the_moped_and_battery_records() {
+        let vehicle = Vehicle { vin: "VIN1234567890ABCD".to_string(), software: 0x0102_0304, times_on: 812 };
+        let record = BatteryRecord {
+            id: 7,
+            charges: 143,
+            fast_charges: 0,
+            normal_charges: 140,
+            slow_charges: 3,
+            discharged_ah: 2500,
+            started: "2024-03-19".to_string(),
+        };
+        let [common, battery] = build_records_frames(&vehicle, &record, 1);
+        assert_eq!(parse_vehicle(&Frame::parse(&common).unwrap()), Some(vehicle));
+        assert_eq!(parse_battery_record(&Frame::parse(&battery).unwrap()), Some(record));
+        assert_eq!(parse_vehicle(&Frame::parse(&battery).unwrap()), None);
+        assert_eq!(parse_battery_record(&Frame::parse(&common).unwrap()), None);
+    }
+
+    #[test]
+    fn a_cell_reading_that_makes_no_sense_stays_unknown() {
+        assert_eq!(cell_volts(0), None);
+        assert_eq!(cell_volts(3650), Some(3.65));
+        assert!((cell_volts(47841).unwrap() - 3.65).abs() < 0.001);
+        assert_eq!(cell_volts(100), None);
     }
 }

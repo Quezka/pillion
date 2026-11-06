@@ -5,12 +5,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use jni::objects::{JClass, JString};
-use jni::sys::jstring;
+use jni::objects::{JByteArray, JClass, JString};
+use jni::sys::{jint, jstring};
 use jni::JNIEnv;
 use winit::platform::android::activity::AndroidApp;
 
-use crate::engine::{BluetoothState, CallState, Command, Engine};
+use crate::engine::{BluetoothState, CallState, Command, Engine, UpdateState, VoicePack};
 use crate::locale::Lang;
 use crate::protocol::{from_hex, to_hex, ClockTime};
 use crate::ui::CompanionApp;
@@ -49,7 +49,16 @@ fn encode(command: Command) -> String {
         Command::SetSpeechRate(rate) => vec!["rate".into(), rate.to_string()],
         Command::FetchRoute { url, destination } => vec!["route".into(), url, destination],
         Command::Search { url } => vec!["search".into(), url],
-        Command::AskText { key, title, hint } => vec!["ask".into(), key, title, hint],
+        Command::AskText { key, title, hint, dark } => vec!["ask".into(), key, title, hint, u8::from(dark).to_string()],
+        Command::Haptic => vec!["haptic".into()],
+        Command::ScanQr { title, torch, type_it, cancel } => vec!["scan_qr".into(), title, torch, type_it, cancel],
+        Command::CheckUpdate { url } => vec!["update_check".into(), url],
+        Command::InstallUpdate { url, sha256 } => vec!["update_install".into(), url, sha256],
+        Command::VoiceDownload => vec!["voice_download".into()],
+        Command::VoiceRemove => vec!["voice_remove".into()],
+        Command::VoiceNatural(on) => vec!["voice_natural".into(), u8::from(on).to_string()],
+        Command::FetchTile { z, x, y } => vec!["tile".into(), z.to_string(), x.to_string(), y.to_string()],
+        Command::Share(text) => vec!["share".into(), text],
         Command::OpenNotificationAccess => vec!["notif_access".into()],
         Command::SetLanguage(code) => vec!["lang".into(), code.into()],
         Command::EnableBluetooth => vec!["bt_enable".into()],
@@ -111,6 +120,31 @@ fn handle_event(e: &mut Engine, message: &str) {
         ["text", key, value] => e.on_text(key, value),
         ["button"] => e.speak_status(),
         ["voice_missing"] => e.voice_missing = true,
+        ["voice_pack", state, percent] => e.on_voice_pack(match *state {
+            "ready" => VoicePack::Ready,
+            "downloading" => VoicePack::Downloading(percent.parse().unwrap_or(0)),
+            "failed" => VoicePack::Failed,
+            _ => VoicePack::None,
+        }),
+        ["update_ok", json] => e.on_update_reply(Ok(json)),
+        ["update_err", error] => e.on_update_reply(Err(error)),
+        ["update_state", state, percent] => e.on_update_state(match *state {
+            "downloading" => UpdateState::Downloading(percent.parse().unwrap_or(0)),
+            "permission" => UpdateState::NeedsPermission,
+            "installing" => UpdateState::Installing,
+            _ => UpdateState::InstallFailed,
+        }),
+        ["qr_type"] => e.ask_pairing(),
+        ["tile", z, x, y, path] => {
+            if let (Ok(z), Ok(x), Ok(y)) = (z.parse(), x.parse(), y.parse()) {
+                e.on_tile((z, x, y), path);
+            }
+        }
+        ["tile_failed", z, x, y] => {
+            if let (Ok(z), Ok(x), Ok(y)) = (z.parse(), x.parse(), y.parse()) {
+                e.on_tile_failed((z, x, y));
+            }
+        }
         ["system", language, dark] => e.on_system(Lang::from_code(language), *dark == "1"),
         ["bt", state] => e.on_bluetooth(match *state {
             "off" => BluetoothState::Off,
@@ -145,6 +179,23 @@ pub extern "system" fn Java_io_github_quezka_pillion_Native_poll(env: JNIEnv, _c
         return std::ptr::null_mut();
     };
     env.new_string(encode(command)).map_or(std::ptr::null_mut(), JString::into_raw)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_quezka_pillion_Native_decodeQr(
+    env: JNIEnv,
+    _class: JClass,
+    brightness: JByteArray,
+    width: jint,
+    height: jint,
+) -> jstring {
+    let Ok(pixels) = env.convert_byte_array(&brightness) else {
+        return std::ptr::null_mut();
+    };
+    match crate::qr::read_pairing_code(&pixels, width as usize, height as usize) {
+        Some(code) => env.new_string(code).map_or(std::ptr::null_mut(), JString::into_raw),
+        None => std::ptr::null_mut(),
+    }
 }
 
 #[no_mangle]

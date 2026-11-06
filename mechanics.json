@@ -398,6 +398,144 @@
       "group": "dash",
       "value": true,
       "estimated": true
+    },
+    {
+      "name": "batteries supported",
+      "group": "battery",
+      "value": 2,
+      "source": "MessageId0x56_CAN groups 0450/0470, 0451/0471, 0340"
+    },
+    {
+      "name": "combined percent weighted by full capacity",
+      "group": "battery",
+      "value": true,
+      "estimated": true
+    },
+    {
+      "name": "charge lights per battery on the model",
+      "group": "model",
+      "value": 5,
+      "estimated": true
+    },
+    {
+      "name": "3D model wheelbase",
+      "group": "model",
+      "value": 1.34,
+      "unit": "m",
+      "estimated": true
+    },
+    {
+      "name": "3D model front wheel radius",
+      "group": "model",
+      "value": 0.238,
+      "unit": "m",
+      "estimated": true
+    },
+    {
+      "name": "3D model rear wheel radius",
+      "group": "model",
+      "value": 0.256,
+      "unit": "m",
+      "estimated": true
+    },
+    {
+      "name": "battery charge count",
+      "group": "battery",
+      "value": "group 0028, offset 12, 2 bytes",
+      "source": "MessageId0x55_Local0x0028.getTotalChargeCount"
+    },
+    {
+      "name": "total discharged scale",
+      "group": "battery",
+      "value": 5,
+      "source": "MessageId0x55_Local0x0028.getTotalDischargeCapacity"
+    },
+    {
+      "name": "frame number length",
+      "group": "vehicle",
+      "value": 17,
+      "unit": "characters",
+      "source": "LocalId0xF190"
+    },
+    {
+      "name": "times switched on",
+      "group": "vehicle",
+      "value": "group F1A2, 2 bytes",
+      "source": "MessageId0x5B_CommonRecords.getECUIgnitionTotalCount"
+    },
+    {
+      "name": "throttle",
+      "group": "vehicle",
+      "value": "group 0220, offset 7, 1 byte",
+      "unit": "%",
+      "source": "MessageId0x56_CAN.getAPSOpening"
+    },
+    {
+      "name": "cell voltage scale",
+      "group": "battery",
+      "value": "5/65536, or millivolts",
+      "unit": "V",
+      "estimated": true
+    },
+    {
+      "name": "charge current limit scale",
+      "group": "battery",
+      "value": 0.5,
+      "unit": "A",
+      "source": "MessageId0x56_CAN.getCurrentLimitCharge1"
+    },
+    {
+      "name": "commands the phone can send",
+      "group": "bluetooth",
+      "value": "login, clock, dash flags",
+      "source": "ev package: MessageId0xAA, MessageId0xA6 only"
+    },
+    {
+      "name": "turn warning time",
+      "group": "navigation",
+      "value": 24,
+      "unit": "s",
+      "estimated": true
+    },
+    {
+      "name": "final turn time",
+      "group": "navigation",
+      "value": 5,
+      "unit": "s",
+      "estimated": true
+    },
+    {
+      "name": "long stretch worth announcing",
+      "group": "navigation",
+      "value": 1500,
+      "unit": "m",
+      "estimated": true
+    },
+    {
+      "name": "map picture kept",
+      "group": "navigation",
+      "value": 7,
+      "unit": "days",
+      "source": "tile.openstreetmap.org usage policy"
+    },
+    {
+      "name": "speech engine",
+      "group": "voice",
+      "value": "sherpa-onnx 1.13.8 with Piper medium voices",
+      "estimated": true
+    },
+    {
+      "name": "update check retry after no answer",
+      "group": "updates",
+      "value": 600,
+      "unit": "s",
+      "estimated": true
+    },
+    {
+      "name": "update checks a day",
+      "group": "updates",
+      "value": 1,
+      "estimated": true
     }
   ]
 }

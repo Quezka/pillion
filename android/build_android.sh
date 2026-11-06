@@ -41,8 +41,28 @@ build_native() {
     mkdir -p "$OUT/apk/lib/$abi"
     cp "$APP/target/$triple/release/$LIB" "$OUT/apk/lib/$abi/$LIB"
 }
+# The natural voice's engine: Apache 2.0, with ONNX Runtime (MIT) and espeak-ng (GPL 3) inside. It's kept out of the
+# repository for its size, and is checked against this sum wherever it's fetched. Version 2 dropped espeak-ng, which these
+# voices need to turn words into sounds, so this stays on the last version that has it.
+SHERPA_VERSION=1.13.8
+SHERPA_SUM=b22c3fc1b6a45666d28892bb2f7694beeb77a8362d7ebd77c1a5431ec9435471
+SHERPA="$HERE/third_party/sherpa-onnx-$SHERPA_VERSION.aar"
+if ! echo "$SHERPA_SUM  $SHERPA" | sha256sum -c --status 2>/dev/null; then
+    mkdir -p "$HERE/third_party"
+    curl -fsSL -o "$SHERPA" "https://github.com/k2-fsa/sherpa-onnx/releases/download/v$SHERPA_VERSION/sherpa-onnx-static-link-onnxruntime-$SHERPA_VERSION.aar"
+    echo "$SHERPA_SUM  $SHERPA" | sha256sum -c --status
+fi
+
+# Phones are arm64. PILLION_ARM_ONLY leaves out the x86_64 parts that only test phones on a computer use, which saves 10 MB.
+ABIS="arm64-v8a"
 build_native aarch64-linux-android arm64-v8a AARCH64_LINUX_ANDROID
-build_native x86_64-linux-android x86_64 X86_64_LINUX_ANDROID
+if [ -z "${PILLION_ARM_ONLY:-}" ]; then
+    ABIS="$ABIS x86_64"
+    build_native x86_64-linux-android x86_64 X86_64_LINUX_ANDROID
+fi
+for abi in $ABIS; do
+    unzip -qoj "$SHERPA" "jni/$abi/libsherpa-onnx-jni.so" -d "$OUT/apk/lib/$abi"
+done
 
 "$BUILD_TOOLS/aapt2" compile --dir "$HERE/res" -o "$OUT/res.zip"
 # The version comes from Cargo.toml, and each release must count higher for Android to accept the update.
@@ -62,7 +82,7 @@ javac -nowarn -Xlint:-options --release 8 -classpath "$PLATFORM_JAR" -d "$OUT/cl
 
 (
     cd "$OUT/apk"
-    "$BUILD_TOOLS/aapt" add unsigned.apk classes.dex "lib/arm64-v8a/$LIB" "lib/x86_64/$LIB" >/dev/null
+    "$BUILD_TOOLS/aapt" add unsigned.apk classes.dex $(find lib -name '*.so') >/dev/null
 )
 "$BUILD_TOOLS/zipalign" -f -p 4 "$OUT/apk/unsigned.apk" "$OUT/aligned.apk"
 

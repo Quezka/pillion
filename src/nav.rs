@@ -8,6 +8,16 @@ const EARTH_RADIUS_M: f64 = 6_371_000.0;
 pub const TOP_SPEED_KMH: u32 = 45;
 pub const EARLY_ANNOUNCE_M: f64 = 300.0;
 pub const FINAL_ANNOUNCE_M: f64 = 60.0;
+/// How much warning a turn gets, in time, so that it's as useful at 20 km/h as at 45.
+const EARLY_ANNOUNCE_S: f64 = 24.0;
+const FINAL_ANNOUNCE_S: f64 = 5.0;
+const EARLY_LIMITS_M: (f64, f64) = (150.0, 350.0);
+const FINAL_LIMITS_M: (f64, f64) = (30.0, 70.0);
+/// After a turn, a long way to the next one is worth saying, so the rider knows all is well.
+const LONG_STRETCH_M: f64 = 1500.0;
+/// How far around the rider the place search looks first, in degrees.
+const SEARCH_NEAR_DEG: (f64, f64) = (0.3, 0.2);
+const HEADING_TOLERANCE_DEG: u32 = 60;
 pub const OFF_ROUTE_M: f64 = 50.0;
 pub const OFF_ROUTE_FIXES: u32 = 5;
 const REROUTE_RETRY_FIXES: u32 = 30;
@@ -27,6 +37,12 @@ pub struct Maneuver {
     pub text: String,
     pub spoken_before: String,
     pub spoken_at: String,
+    /// Said once the turn is done, such as "continue for 3 km".
+    pub spoken_after: String,
+    /// The next turn comes so soon that this one's instruction already mentions it.
+    pub joined_to_next: bool,
+    /// Which exit to take, on a roundabout.
+    pub exit: u32,
     pub begin: usize,
 }
 
@@ -35,18 +51,23 @@ impl Maneuver {
         matches!(self.kind, 4..=6)
     }
 
-    /// Direction for the arrow, in degrees clockwise from straight ahead.
-    pub fn arrow_angle(&self) -> f32 {
+    pub fn is_roundabout(&self) -> bool {
+        matches!(self.kind, 26 | 27)
+    }
+
+    /// The arrow for this step. Valhalla's numbers: ramps are 17 to 19, exits 20 and 21, forks 22 to 24, merges 25, 37, 38.
+    pub fn symbol(&self) -> &'static str {
         match self.kind {
-            9 | 19 | 23 => 45.0,
-            10 | 20 => 90.0,
-            11 => 135.0,
-            12 => 180.0,
-            13 => -180.0,
-            14 => -135.0,
-            15 | 21 => -90.0,
-            16 | 22 | 24 => -45.0,
-            _ => 0.0,
+            4..=6 => "flag",
+            9 | 18 | 23 | 37 => "turn-slight-right",
+            10 | 20 => "turn-right",
+            11 => "turn-sharp-right",
+            12 => "u-turn-right",
+            13 => "u-turn-left",
+            14 => "turn-sharp-left",
+            15 | 21 => "turn-left",
+            16 | 19 | 24 | 38 => "turn-slight-left",
+            _ => "turn-straight",
         }
     }
 }
@@ -61,11 +82,19 @@ pub struct Route {
     pub total_s: f64,
 }
 
-fn distance_m(a: LatLon, b: LatLon) -> f64 {
+pub fn distance_m(a: LatLon, b: LatLon) -> f64 {
     let mean_lat = ((a.0 + b.0) / 2.0).to_radians();
     let dx = (b.1 - a.1).to_radians() * mean_lat.cos();
     let dy = (b.0 - a.0).to_radians();
     (dx * dx + dy * dy).sqrt() * EARTH_RADIUS_M
+}
+
+/// The direction from one point to another, in degrees clockwise from north.
+pub fn bearing_deg(a: LatLon, b: LatLon) -> f64 {
+    let mean_lat = ((a.0 + b.0) / 2.0).to_radians();
+    let dx = (b.1 - a.1).to_radians() * mean_lat.cos();
+    let dy = (b.0 - a.0).to_radians();
+    dx.atan2(dy).to_degrees().rem_euclid(360.0)
 }
 
 /// Valhalla's shape: Google polyline encoding with six decimals.
@@ -100,24 +129,32 @@ fn text_field(m: &Value, keys: &[&str]) -> String {
         .to_string()
 }
 
-/// `nearby` also accepts roads around the destination, for places a moped can't drive right up to.
-pub fn route_request_url(from: LatLon, to: LatLon, nearby: bool) -> String {
+/// `nearby` also accepts roads around the destination, for places a moped can't drive right up to. `heading` is the way the
+/// rider is already going, so that a new route doesn't begin with a U-turn.
+pub fn route_request_url(from: LatLon, to: LatLon, nearby: bool, heading: Option<f64>) -> String {
+    let way = heading.map_or(String::new(), |h| format!(r#","heading":{h:.0},"heading_tolerance":{HEADING_TOLERANCE_DEG}"#));
     let radius = if nearby { format!(r#","radius":{NEARBY_RADIUS_M}"#) } else { String::new() };
     let body = format!(
         concat!(
-            r#"{{"locations":[{{"lat":{},"lon":{}}},{{"lat":{},"lon":{}{}}}],"#,
+            r#"{{"locations":[{{"lat":{},"lon":{}{}}},{{"lat":{},"lon":{}{}}}],"#,
             r#""costing":"motor_scooter","costing_options":{{"motor_scooter":{{"top_speed":{}}}}},"#,
             r#""directions_options":{{"units":"kilometers","language":"{}"}}}}"#
         ),
-        from.0, from.1, to.0, to.1, radius, TOP_SPEED_KMH, locale::current().route_code()
+        from.0, from.1, way, to.0, to.1, radius, TOP_SPEED_KMH, locale::current().route_code()
     );
     format!("https://valhalla1.openstreetmap.de/route?json={}", percent_encode(&body))
 }
 
-pub fn search_request_url(query: &str) -> String {
+/// `near` is where the rider is, so that places close by come first when a name exists in many towns.
+pub fn search_request_url(query: &str, near: Option<LatLon>) -> String {
+    let around = near.map_or(String::new(), |p| {
+        let (dx, dy) = SEARCH_NEAR_DEG;
+        format!("&viewbox={:.3},{:.3},{:.3},{:.3}", p.1 - dx, p.0 + dy, p.1 + dx, p.0 - dy)
+    });
     format!(
-        "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=6&accept-language={}&q={}",
+        "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=6&accept-language={}{}&q={}",
         locale::current().code(),
+        around,
         percent_encode(query)
     )
 }
@@ -164,15 +201,24 @@ pub fn parse_route(json: &str, destination: &str) -> Result<Route, String> {
     let list = leg["maneuvers"].as_array().ok_or("the route has no directions")?;
     let maneuvers: Vec<Maneuver> = list
         .iter()
-        .map(|m| Maneuver {
-            kind: m["type"].as_u64().unwrap_or(0) as u32,
-            text: text_field(m, &["instruction"]),
-            spoken_before: text_field(m, &["verbal_pre_transition_instruction", "instruction"]),
-            spoken_at: text_field(
-                m,
-                &["verbal_succinct_transition_instruction", "verbal_pre_transition_instruction", "instruction"],
-            ),
-            begin: m["begin_shape_index"].as_u64().unwrap_or(0) as usize,
+        .map(|m| {
+            let joined_to_next = m["verbal_multi_cue"].as_bool().unwrap_or(false);
+            // When two turns come together, the short form would leave out the second one.
+            let at_keys: &[&str] = if joined_to_next {
+                &["verbal_pre_transition_instruction", "instruction"]
+            } else {
+                &["verbal_succinct_transition_instruction", "verbal_pre_transition_instruction", "instruction"]
+            };
+            Maneuver {
+                kind: m["type"].as_u64().unwrap_or(0) as u32,
+                text: text_field(m, &["instruction"]),
+                spoken_before: text_field(m, &["verbal_pre_transition_instruction", "instruction"]),
+                spoken_at: text_field(m, at_keys),
+                spoken_after: text_field(m, &["verbal_post_transition_instruction"]),
+                joined_to_next,
+                exit: m["roundabout_exit_count"].as_u64().unwrap_or(0) as u32,
+                begin: m["begin_shape_index"].as_u64().unwrap_or(0) as usize,
+            }
         })
         .collect();
     Ok(Route::new(destination, points, maneuvers, v["trip"]["summary"]["time"].as_f64().unwrap_or(0.0)))
@@ -306,7 +352,12 @@ impl Navigation {
         tf("Route ready, {} kilometres, about {} minutes. {}", &[&format!("{km:.1}"), &format!("{minutes:.0}"), &first])
     }
 
-    pub fn update(&mut self, at: LatLon) -> Vec<NavEvent> {
+    /// Where a position lands on the route's line, as a share of its index, for drawing what's been ridden.
+    pub fn index_along(&self) -> usize {
+        self.route.along_m.partition_point(|a| *a < self.along_m).min(self.route.points.len().saturating_sub(1))
+    }
+
+    pub fn update(&mut self, at: LatLon, speed_mps: Option<f64>) -> Vec<NavEvent> {
         let mut events = Vec::new();
         let (off_by, along) = locate(&self.route, at, self.along_m);
         if off_by > OFF_ROUTE_M {
@@ -322,13 +373,16 @@ impl Navigation {
         self.off_route = false;
         self.along_m = self.along_m.max(along);
 
+        let mut just_passed = None;
         while self.next < self.route.maneuvers.len() {
             let is_last = self.next + 1 == self.route.maneuvers.len();
             if is_last || self.maneuver_along(self.next) > self.along_m {
                 break;
             }
+            just_passed = Some(self.next);
+            // If the last instruction already mentioned this turn, it doesn't need warning about again.
+            self.early_said = self.route.maneuvers[self.next].joined_to_next;
             self.next += 1;
-            self.early_said = false;
             self.final_said = false;
         }
 
@@ -340,13 +394,22 @@ impl Navigation {
             events.push(NavEvent::Arrived);
             return events;
         }
-        if distance <= FINAL_ANNOUNCE_M {
+        if let Some(passed) = just_passed {
+            let after = &self.route.maneuvers[passed].spoken_after;
+            if !after.is_empty() && distance > LONG_STRETCH_M {
+                events.push(NavEvent::Say { text: after.clone() });
+            }
+        }
+        let (early_m, final_m) = speed_mps.map_or((EARLY_ANNOUNCE_M, FINAL_ANNOUNCE_M), |s| {
+            ((s * EARLY_ANNOUNCE_S).clamp(EARLY_LIMITS_M.0, EARLY_LIMITS_M.1), (s * FINAL_ANNOUNCE_S).clamp(FINAL_LIMITS_M.0, FINAL_LIMITS_M.1))
+        });
+        if distance <= final_m {
             if !self.final_said {
                 self.final_said = true;
                 self.early_said = true;
                 events.push(NavEvent::Say { text: m.spoken_at });
             }
-        } else if distance <= EARLY_ANNOUNCE_M && !self.early_said {
+        } else if distance <= early_m && !self.early_said {
             self.early_said = true;
             events.push(NavEvent::Say {
                 text: tf("In {} metres, {}", &[&spoken_metres(distance), &m.spoken_before]),
@@ -367,6 +430,7 @@ mod tests {
             spoken_before: format!("{name} soon"),
             spoken_at: name.to_string(),
             begin,
+            ..Default::default()
         }
     }
 
@@ -425,19 +489,19 @@ mod tests {
 
     #[test]
     fn urls_are_encoded_and_ask_for_the_scooter_profile() {
-        let url = route_request_url((48.1, 2.2), (48.3, 2.4), false);
+        let url = route_request_url((48.1, 2.2), (48.3, 2.4), false, None);
         assert!(url.contains("motor_scooter"));
         assert!(!url.contains("radius"));
-        assert!(route_request_url((48.1, 2.2), (48.3, 2.4), true).contains("radius%22%3A300"));
+        assert!(route_request_url((48.1, 2.2), (48.3, 2.4), true, None).contains("radius%22%3A300"));
         assert!(url.contains("top_speed%22%3A45"));
         assert!(!url.contains(' '));
-        assert!(search_request_url("a b&c").ends_with("q=a%20b%26c"));
+        assert!(search_request_url("a b&c", None).ends_with("q=a%20b%26c"));
     }
 
     #[test]
     fn announces_each_turn_once_early_then_final_then_arrives() {
         let mut nav = Navigation::new(sample());
-        assert!(nav.update((48.0, 2.0)).is_empty());
+        assert!(nav.update((48.0, 2.0), None).is_empty());
         let mut said = Vec::new();
         let mut arrived = false;
         let mut path: Vec<LatLon> = Vec::new();
@@ -449,7 +513,7 @@ mod tests {
         }
         path.push(*nav.route.points.last().unwrap());
         for at in path {
-            for e in nav.update(at) {
+            for e in nav.update(at, None) {
                 match e {
                     NavEvent::Say { text } => said.push(text),
                     NavEvent::Arrived => arrived = true,
@@ -471,11 +535,11 @@ mod tests {
         let away = (48.0, 2.01);
         let mut reroutes = 0;
         for _ in 0..12 {
-            reroutes += nav.update(away).iter().filter(|e| **e == NavEvent::Reroute).count();
+            reroutes += nav.update(away, None).iter().filter(|e| **e == NavEvent::Reroute).count();
         }
         assert_eq!(reroutes, 1);
         assert!(nav.off_route);
-        nav.update((48.0, 2.0));
+        nav.update((48.0, 2.0), None);
         assert!(!nav.off_route);
     }
 
@@ -484,12 +548,12 @@ mod tests {
         let mut nav = Navigation::new(sample());
         let away = (48.0, 2.01);
         for _ in 0..OFF_ROUTE_FIXES {
-            nav.update(away);
+            nav.update(away, None);
         }
         assert!(nav.off_route);
         nav.reroute_failed();
         let mut fixes = 0;
-        while nav.update(away).is_empty() {
+        while nav.update(away, None).is_empty() {
             fixes += 1;
             assert!(fixes < 100);
         }
@@ -500,17 +564,90 @@ mod tests {
     fn single_gps_blip_does_not_reroute() {
         let mut nav = Navigation::new(sample());
         for _ in 0..3 {
-            assert!(nav.update((48.0, 2.01)).is_empty());
-            assert!(nav.update((48.0, 2.0)).is_empty());
+            assert!(nav.update((48.0, 2.01), None).is_empty());
+            assert!(nav.update((48.0, 2.0), None).is_empty());
         }
     }
 
     #[test]
     fn progress_never_goes_backwards_at_a_red_light_jitter() {
         let mut nav = Navigation::new(sample());
-        nav.update((48.005, 2.0));
+        nav.update((48.005, 2.0), None);
         let before = nav.along_m;
-        nav.update((48.0049, 2.0));
+        nav.update((48.0049, 2.0), None);
         assert_eq!(nav.along_m, before);
+    }
+
+    #[test]
+    fn arrows_point_the_right_way_on_ramps_and_forks() {
+        let symbol = |kind| Maneuver { kind, ..Default::default() }.symbol();
+        assert_eq!(symbol(18), "turn-slight-right");
+        assert_eq!(symbol(19), "turn-slight-left");
+        assert_eq!(symbol(22), "turn-straight");
+        assert_eq!(symbol(38), "turn-slight-left");
+        assert_eq!(symbol(5), "flag");
+        assert!(Maneuver { kind: 26, ..Default::default() }.is_roundabout());
+    }
+
+    #[test]
+    fn warning_distance_follows_the_speed() {
+        let first_warning_at = |speed: f64| {
+            let mut nav = Navigation::new(sample());
+            for i in 0..90 {
+                let at = (48.0 + f64::from(i) * 0.0001, 2.0);
+                if !nav.update(at, Some(speed)).is_empty() {
+                    return nav.distance_to_next_m();
+                }
+            }
+            panic!("no warning");
+        };
+        assert!(first_warning_at(12.5) > 280.0);
+        assert!(first_warning_at(4.0) < 170.0);
+    }
+
+    #[test]
+    fn a_long_stretch_after_a_turn_is_announced_and_a_joined_turn_is_not_warned_twice() {
+        let mut points: Vec<LatLon> = (0..=4).map(|i| (48.0 + f64::from(i) * 0.001, 2.0)).collect();
+        let corner = points[4];
+        points.extend((1..=40).map(|i| (corner.0, 2.0 + f64::from(i) * 0.001)));
+        let mut turn = step(10, 4, "Turn right");
+        turn.spoken_after = "Continue for 3 km".to_string();
+        let route = Route::new("Test", points, vec![step(1, 0, "Start"), turn, step(4, 44, "Arrive")], 300.0);
+        let mut nav = Navigation::new(route);
+        let mut said = Vec::new();
+        for i in 0..=12 {
+            let at = (48.0 + f64::from(i) * 0.0004, 2.0);
+            for e in nav.update(at, None) {
+                if let NavEvent::Say { text } = e {
+                    said.push(text);
+                }
+            }
+        }
+        assert!(said.iter().any(|s| s == "Continue for 3 km"), "{said:?}");
+
+        let mut joined = step(10, 2, "First");
+        joined.joined_to_next = true;
+        let points: Vec<LatLon> = (0..=30).map(|i| (48.0 + f64::from(i) * 0.0005, 2.0)).collect();
+        let route = Route::new("Test", points, vec![step(1, 0, "Start"), joined, step(15, 4, "Second"), step(4, 30, "Arrive")], 300.0);
+        let mut nav = Navigation::new(route);
+        let mut said = Vec::new();
+        for i in 0..=8 {
+            for e in nav.update((48.0 + f64::from(i) * 0.0002, 2.0), None) {
+                if let NavEvent::Say { text } = e {
+                    said.push(text);
+                }
+            }
+        }
+        assert!(!said.iter().any(|s| s.starts_with("In ") && s.contains("Second")), "{said:?}");
+    }
+
+    #[test]
+    fn a_reroute_can_keep_the_way_the_rider_is_going_and_search_looks_nearby_first() {
+        let url = route_request_url((48.1, 2.2), (48.3, 2.4), false, Some(90.0));
+        assert!(url.contains("heading%22%3A90"));
+        assert!(url.contains("heading_tolerance"));
+        assert!(search_request_url("cafe", Some((48.0, 2.0))).contains("viewbox=1.700,48.200,2.300,47.800"));
+        assert!((bearing_deg((48.0, 2.0), (48.0, 2.1)) - 90.0).abs() < 0.5);
+        assert!(bearing_deg((48.0, 2.0), (47.9, 2.0)) > 179.0);
     }
 }

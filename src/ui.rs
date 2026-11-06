@@ -1,16 +1,19 @@
 //! The phone screens, in the suite's Material 3 look. All of them read from and act on the shared `Engine`.
 
+use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{
-    self, Align, Align2, CentralPanel, Color32, CornerRadius, FontId, Frame, Layout, Margin, Painter, Panel, Pos2, Rect,
-    RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, Vec2,
+    self, Align, Align2, CentralPanel, Color32, CornerRadius, FontId, Frame, Id, Layout, Margin, Painter, Panel, Pos2,
+    Rect, ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2,
 };
 
-use crate::engine::{Appearance, BluetoothState, Engine, Link, NotifLevel};
+use crate::engine::{Appearance, BluetoothState, Engine, Link, MopedColor, NotifLevel, TileKey, UpdateState, VoicePack};
 use crate::locale::{self, t, tf, Lang};
-use crate::nav::{Maneuver, Navigation};
+use crate::m3::{self, text, Kind};
+use crate::model3d::{self, Scene};
+use crate::nav::{self, LatLon, Maneuver, Navigation};
 use crate::protocol as proto;
 use crate::theme::{self, icon, Tokens, Weight};
 
@@ -21,7 +24,31 @@ const RING_START_DEG: f32 = 135.0;
 const RING_SWEEP_DEG: f32 = 270.0;
 const SCREENSHOT_AFTER_FRAMES: u32 = 120;
 const MAX_RECENTS_SHOWN: usize = 5;
-const CARD_RADIUS: u8 = 16;
+const FADE_SECONDS: f64 = 0.16;
+const SNACK_SECONDS: f64 = 4.0;
+const FAB_ROOM: f32 = 84.0;
+
+const MODEL_HEIGHT: f32 = 290.0;
+const TURN_PER_POINT: f32 = 0.011;
+const CAMERA_EASE: f32 = 0.16;
+const SETTLED: f32 = 0.0015;
+const ZOOM_LIMITS: (f32, f32) = (0.75, 2.6);
+/// Longest side of the picture while it moves. Small enough to turn smoothly on a phone.
+const MOVING_MAX_PX: f32 = 560.0;
+const STILL_MAX_PX: f32 = 900.0;
+const WHITE_BODY: [u8; 3] = [236, 236, 232];
+const BLACK_BODY: [u8; 3] = [38, 38, 44];
+const TEAL_BODY: [u8; 3] = [22, 190, 195];
+
+const MAP_HEIGHT: f32 = 320.0;
+const TILE_POINTS: f32 = 256.0;
+const CLOSE_ZOOM: u8 = 17;
+const FAR_ZOOM: u8 = 16;
+/// Above this speed the map looks further ahead.
+const FAR_ZOOM_KMH: f64 = 28.0;
+const TILES_DECODED_PER_FRAME: usize = 3;
+const TILES_KEPT: usize = 60;
+const HEADING_EASE: f32 = 0.12;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -33,6 +60,72 @@ enum Screen {
     Settings,
 }
 
+/// The part of the moped being looked at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Batteries,
+    Motor,
+    Dash,
+}
+
+impl Focus {
+    /// Where the camera goes to see this part best: (yaw, pitch).
+    fn view(self) -> (f32, f32) {
+        match self {
+            Self::Batteries => (0.62, 0.52),
+            Self::Motor => (-0.42, 0.14),
+            Self::Dash => (2.45, 0.42),
+        }
+    }
+}
+
+struct ModelView {
+    yaw: f32,
+    pitch: f32,
+    zoom: f32,
+    seat: f32,
+    target_yaw: f32,
+    target_pitch: f32,
+    focus: Focus,
+    texture: Option<TextureHandle>,
+    drawn: Option<(Scene, usize, usize, usize)>,
+}
+
+impl ModelView {
+    fn new() -> Self {
+        let focus = Focus::Batteries;
+        let (yaw, pitch) = focus.view();
+        Self {
+            yaw,
+            pitch,
+            zoom: 1.0,
+            seat: 1.0,
+            target_yaw: yaw,
+            target_pitch: pitch,
+            focus,
+            texture: None,
+            drawn: None,
+        }
+    }
+
+    fn select(&mut self, focus: Focus) {
+        self.focus = focus;
+        let (yaw, pitch) = focus.view();
+        // The short way round from wherever it's been turned to.
+        let turns = ((self.yaw - yaw) / std::f32::consts::TAU).round();
+        self.target_yaw = yaw + turns * std::f32::consts::TAU;
+        self.target_pitch = pitch;
+    }
+
+    fn seat_target(&self) -> f32 {
+        if self.focus == Focus::Batteries {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
 pub struct CompanionApp {
     engine: Arc<Mutex<Engine>>,
     screen: Screen,
@@ -42,149 +135,52 @@ pub struct CompanionApp {
     typed_key: Option<(String, String)>,
     confirm_forget: bool,
     fonts_ready: bool,
+    changed_screen_at: f64,
+    snack: Option<(String, f64)>,
+    model: ModelView,
+    map: MapView,
+}
+
+/// The street map: pictures of it, and how it's looking at the route.
+#[derive(Default)]
+struct MapView {
+    tiles: HashMap<TileKey, TextureHandle>,
+    dark: bool,
+    whole_route: bool,
+    heading_deg: f32,
+}
+
+/// A position in map pictures, at a zoom level. North is up.
+fn map_position(at: LatLon, z: u8) -> Vec2 {
+    let n = f64::from(1u32 << z);
+    let x = (at.1 + 180.0) / 360.0 * n;
+    let lat = at.0.to_radians();
+    let y = (1.0 - lat.tan().asinh() / std::f64::consts::PI) / 2.0 * n;
+    Vec2::new(x as f32, y as f32)
+}
+
+/// Loads a map picture. The dark look turns it into a night map, keeping its roads readable.
+fn load_tile(path: &str, dark: bool) -> Option<egui::ColorImage> {
+    let bytes = std::fs::read(path).ok()?;
+    let picture = resvg::tiny_skia::Pixmap::decode_png(&bytes).ok()?;
+    let (w, h) = (picture.width() as usize, picture.height() as usize);
+    let mut pixels: Vec<u8> = picture.take();
+    if dark {
+        for p in pixels.chunks_mut(4) {
+            let grey = (u16::from(p[0]) * 3 + u16::from(p[1]) * 6 + u16::from(p[2])) / 10;
+            let night = 255 - grey as u8;
+            p[0] = (f32::from(night) * 0.62 + f32::from(p[0]) * 0.06) as u8;
+            p[1] = (f32::from(night) * 0.64 + f32::from(p[1]) * 0.06) as u8;
+            p[2] = (f32::from(night) * 0.74 + f32::from(p[2]) * 0.06) as u8;
+        }
+    }
+    Some(egui::ColorImage::from_rgba_premultiplied([w, h], &pixels))
 }
 
 struct ScreenshotJob {
     path: String,
     frames: u32,
     asked: bool,
-}
-
-fn text(value: impl Into<String>, size: f32, color: Color32, weight: Weight) -> RichText {
-    RichText::new(value.into()).size(size).color(color).family(weight.family())
-}
-
-fn card_frame(th: &Tokens, fill: Color32) -> Frame {
-    let stroke = if th.outlined { Stroke::new(1.5, th.border) } else { Stroke::NONE };
-    Frame::new()
-        .fill(fill)
-        .stroke(stroke)
-        .corner_radius(CornerRadius::same(CARD_RADIUS))
-        .inner_margin(Margin::same(16))
-}
-
-fn card(ui: &mut Ui, th: &Tokens, add: impl FnOnce(&mut Ui)) {
-    card_frame(th, th.surface).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        add(ui);
-    });
-    ui.add_space(10.0);
-}
-
-/// The one filled colour of a screen, for what matters most on it.
-fn tonal_card(ui: &mut Ui, th: &Tokens, add: impl FnOnce(&mut Ui)) {
-    card_frame(th, th.accent_soft).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        add(ui);
-    });
-    ui.add_space(10.0);
-}
-
-fn caption(ui: &mut Ui, th: &Tokens, value: &str) {
-    ui.label(text(value, 13.0, th.faint, Weight::SemiBold));
-    ui.add_space(6.0);
-}
-
-#[derive(Clone, Copy)]
-enum Kind {
-    Primary,
-    Tonal,
-    Danger,
-}
-
-/// A round Material button, with an optional icon. Full width of whatever holds it.
-fn button(ui: &mut Ui, th: &Tokens, label: &str, glyph: Option<&'static str>, kind: Kind, height: f32) -> bool {
-    let (fill, ink) = match kind {
-        Kind::Primary => (th.accent, th.on_accent),
-        Kind::Tonal => (th.raised, th.text),
-        Kind::Danger => (th.danger, if th.dark { th.bg } else { th.surface }),
-    };
-    let size = Vec2::new(ui.available_width(), height);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    let painter = ui.painter_at(rect);
-    let shade = if response.is_pointer_button_down_on() { fill.gamma_multiply(0.8) } else { fill };
-    let round = CornerRadius::same((height / 2.0).min(120.0) as u8);
-    painter.rect_filled(rect, round, shade);
-    if th.outlined {
-        painter.rect_stroke(rect, round, Stroke::new(1.5, th.border), StrokeKind::Inside);
-    }
-    let font = FontId::new(15.5, Weight::SemiBold.family());
-    let galley = painter.layout_no_wrap(label.to_string(), font, ink);
-    let icon_size = 20.0;
-    let gap = if glyph.is_some() { icon_size + 8.0 } else { 0.0 };
-    let start = rect.center().x - (galley.size().x + gap) / 2.0;
-    if let Some(name) = glyph {
-        let square = Rect::from_center_size(Pos2::new(start + icon_size / 2.0, rect.center().y), Vec2::splat(icon_size));
-        icon(&painter, square, name, false, ink);
-    }
-    painter.galley(Pos2::new(start + gap, rect.center().y - galley.size().y / 2.0), galley, ink);
-    response.clicked()
-}
-
-/// A Material 3 switch, with the whole row to tap: easier in gloves.
-fn switch_row(ui: &mut Ui, th: &Tokens, label: &str, on: bool) -> bool {
-    let wrap = ui.available_width() - 64.0;
-    let font = FontId::new(15.5, Weight::Medium.family());
-    let galley = ui.painter().layout(label.to_string(), font, th.text, wrap);
-    let height = (galley.size().y + 12.0).max(48.0);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
-    let painter = ui.painter_at(rect);
-    painter.galley(Pos2::new(rect.left(), rect.center().y - galley.size().y / 2.0), galley, th.text);
-    let track = Rect::from_center_size(Pos2::new(rect.right() - 26.0, rect.center().y), Vec2::new(52.0, 32.0));
-    let round = CornerRadius::same(16);
-    if on {
-        painter.rect_filled(track, round, th.accent);
-    } else {
-        painter.rect_filled(track, round, th.raised);
-        painter.rect_stroke(track, round, Stroke::new(2.0, th.border), StrokeKind::Inside);
-    }
-    let (x, radius, knob) = if on {
-        (track.right() - 16.0, 12.0, th.on_accent)
-    } else {
-        (track.left() + 16.0, 8.0, th.faint)
-    };
-    painter.circle_filled(Pos2::new(x, track.center().y), radius, knob);
-    response.clicked()
-}
-
-/// The small choice control the suite uses instead of tabs. Returns the option tapped.
-fn segmented(ui: &mut Ui, th: &Tokens, options: &[&str], selected: usize) -> Option<usize> {
-    let size = Vec2::new(ui.available_width(), 44.0);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    let painter = ui.painter_at(rect);
-    painter.rect_stroke(rect, CornerRadius::same(12), Stroke::new(1.0, th.border), StrokeKind::Inside);
-    let width = rect.width() / options.len() as f32;
-    let mut tapped = None;
-    for (i, option) in options.iter().enumerate() {
-        let cell = Rect::from_min_size(rect.min + Vec2::new(width * i as f32, 0.0), Vec2::new(width, rect.height()));
-        let response = ui.interact(cell, ui.scope_id().with(("segment", i, *option)), Sense::click());
-        if i == selected {
-            painter.rect_filled(cell.shrink(3.0), CornerRadius::same(10), th.accent_soft);
-        }
-        let weight = if i == selected { Weight::SemiBold } else { Weight::Medium };
-        let ink = if i == selected { th.text } else { th.muted };
-        painter.text(cell.center(), Align2::CENTER_CENTER, *option, FontId::new(14.0, weight.family()), ink);
-        if response.clicked() {
-            tapped = Some(i);
-        }
-    }
-    tapped
-}
-
-fn stat(ui: &mut Ui, th: &Tokens, value: &str, label: &str) {
-    ui.vertical(|ui| {
-        ui.label(text(value, 17.5, th.text, Weight::Bold));
-        ui.label(text(label, 12.5, th.muted, Weight::Medium));
-    });
-}
-
-/// A stat row with equal columns, whatever the phone's width.
-fn stat_row(ui: &mut Ui, th: &Tokens, stats: &[(String, &str)]) {
-    ui.columns(stats.len(), |columns| {
-        for (column, (value, label)) in columns.iter_mut().zip(stats) {
-            stat(column, th, value, label);
-        }
-    });
 }
 
 fn draw_ring(painter: &Painter, th: &Tokens, center: Pos2, radius: f32, fraction: f32, color: Color32) {
@@ -198,29 +194,32 @@ fn draw_ring(painter: &Painter, th: &Tokens, center: Pos2, radius: f32, fraction
             })
             .collect()
     };
-    painter.line(arc(1.0), Stroke::new(11.0, th.raised));
+    painter.line(arc(1.0), Stroke::new(12.0, th.raised));
     if fraction > 0.0 {
-        painter.line(arc(fraction.clamp(0.0, 1.0)), Stroke::new(11.0, color));
+        painter.line(arc(fraction.clamp(0.0, 1.0)), Stroke::new(12.0, color));
+        // Rounded ends, as Material 3 draws its progress indicators.
+        let round_at = |f: f32| {
+            let a = (RING_START_DEG + RING_SWEEP_DEG * f) * PI / 180.0;
+            center + Vec2::new(a.cos(), a.sin()) * radius
+        };
+        painter.circle_filled(round_at(0.0), 6.0, color);
+        painter.circle_filled(round_at(fraction.clamp(0.0, 1.0)), 6.0, color);
     }
 }
 
-fn turn_symbol(maneuver: Option<&Maneuver>) -> &'static str {
-    let Some(m) = maneuver else {
-        return "turn-straight";
+/// A step's sign: its arrow, or for a roundabout a ring with the exit to take.
+fn draw_turn(painter: &Painter, rect: Rect, maneuver: Option<&Maneuver>, filled: bool, color: Color32) {
+    let Some(m) = maneuver.filter(|m| m.is_roundabout()) else {
+        icon(painter, rect, maneuver.map_or("turn-straight", Maneuver::symbol), filled, color);
+        return;
     };
-    if m.is_arrival() {
-        return "flag";
-    }
-    match m.kind {
-        9 | 19 | 23 => "turn-slight-right",
-        10 | 20 => "turn-right",
-        11 => "turn-sharp-right",
-        12 => "u-turn-right",
-        13 => "u-turn-left",
-        14 => "turn-sharp-left",
-        15 | 21 => "turn-left",
-        16 | 22 | 24 => "turn-slight-left",
-        _ => "turn-straight",
+    let side = rect.width();
+    let centre = rect.center() - Vec2::new(0.0, side * 0.08);
+    let radius = side * 0.3;
+    painter.circle_stroke(centre, radius, Stroke::new(side * 0.1, color));
+    painter.line_segment([centre + Vec2::new(0.0, radius), rect.center_bottom()], Stroke::new(side * 0.1, color));
+    if m.exit > 0 {
+        painter.text(centre, Align2::CENTER_CENTER, m.exit.to_string(), FontId::new(side * 0.34, Weight::Bold.family()), color);
     }
 }
 
@@ -232,7 +231,7 @@ fn format_distance(m: f64) -> String {
     }
 }
 
-fn link_pill(engine: &Engine, th: &Tokens) -> (&'static str, Color32) {
+fn link_status(engine: &Engine, th: &Tokens) -> (&'static str, Color32) {
     if engine.demo_active {
         return (t("Demo ride"), th.warning);
     }
@@ -247,6 +246,10 @@ fn link_pill(engine: &Engine, th: &Tokens) -> (&'static str, Color32) {
     }
 }
 
+fn is_connecting(engine: &Engine) -> bool {
+    !engine.demo_active && matches!(engine.link, Link::Scanning | Link::Connecting | Link::LoggingIn)
+}
+
 /// Places come with long addresses. The first part is the name, the rest says where.
 fn split_place(name: &str) -> (&str, &str) {
     match name.split_once(", ") {
@@ -255,53 +258,24 @@ fn split_place(name: &str) -> (&str, &str) {
     }
 }
 
-/// A tappable two-line list row, with an icon.
-fn list_row(ui: &mut Ui, th: &Tokens, glyph: &'static str, title: &str, detail: &str) -> bool {
-    let width = ui.available_width();
-    let wrap = width - 44.0 - 28.0;
-    let font_title = FontId::new(15.5, Weight::SemiBold.family());
-    let font_detail = FontId::new(13.0, Weight::Regular.family());
-    let title_galley = ui.painter().layout(title.to_string(), font_title, th.text, wrap);
-    let detail_galley = ui.painter().layout(detail.to_string(), font_detail, th.muted, wrap);
-    let detail_height = if detail.is_empty() { 0.0 } else { detail_galley.size().y + 2.0 };
-    let height = (title_galley.size().y + detail_height + 18.0).max(56.0);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
-    let painter = ui.painter_at(rect);
-    if response.is_pointer_button_down_on() {
-        painter.rect_filled(rect, CornerRadius::same(12), th.raised);
+/// How far a place is from the rider, then where it is.
+fn place_detail(from: Option<LatLon>, at: LatLon, detail: &str) -> String {
+    match from {
+        Some(from) => format!("{}, {detail}", format_distance(nav::distance_m(from, at))),
+        None => detail.to_string(),
     }
-    let square = Rect::from_center_size(Pos2::new(rect.left() + 20.0, rect.center().y), Vec2::splat(24.0));
-    icon(&painter, square, glyph, false, th.muted);
-    let x = rect.left() + 44.0;
-    let top = rect.center().y - (title_galley.size().y + detail_height) / 2.0;
-    let title_height = title_galley.size().y;
-    painter.galley(Pos2::new(x, top), title_galley, th.text);
-    if !detail.is_empty() {
-        painter.galley(Pos2::new(x, top + title_height + 2.0), detail_galley, th.muted);
-    }
-    let chevron = Rect::from_center_size(Pos2::new(rect.right() - 12.0, rect.center().y), Vec2::splat(22.0));
-    icon(&painter, chevron, "chevron-right", false, th.faint);
-    response.clicked()
 }
 
-/// A problem the rider can fix right now, with the button that fixes it.
-fn banner(ui: &mut Ui, th: &Tokens, glyph: &'static str, title: &str, detail: &str, action: Option<&str>) -> bool {
-    let mut clicked = false;
-    card(ui, th, |ui| {
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
-            icon(&ui.painter_at(rect), rect, glyph, true, th.warning);
-            ui.add_space(4.0);
-            ui.label(text(title, 15.5, th.text, Weight::Bold));
-        });
-        ui.add_space(4.0);
-        ui.label(text(detail, 13.5, th.muted, Weight::Regular));
-        if let Some(action) = action {
-            ui.add_space(10.0);
-            clicked = button(ui, th, action, None, Kind::Tonal, 44.0);
-        }
-    });
-    clicked
+fn charge_color(th: &Tokens, percent: u8, low: bool) -> Color32 {
+    if low || percent <= LOW_PERCENT {
+        th.danger
+    } else {
+        th.accent
+    }
+}
+
+fn bytes(c: Color32) -> [u8; 3] {
+    [c.r(), c.g(), c.b()]
 }
 
 impl CompanionApp {
@@ -315,11 +289,42 @@ impl CompanionApp {
             typed_key: None,
             confirm_forget: false,
             fonts_ready: false,
+            changed_screen_at: -1.0,
+            snack: None,
+            model: ModelView::new(),
+            map: MapView::default(),
+        }
+    }
+
+    /// Opens on a tab by its English name. For looking at a screen from the command line.
+    pub fn open_tab(&mut self, name: &str) {
+        let screen = match name {
+            "route" => Screen::Route,
+            "voice" => Screen::Voice,
+            "moped" => Screen::Moped,
+            "alerts" => Screen::Alerts,
+            "settings" => Screen::Settings,
+            _ => Screen::Ride,
+        };
+        self.screen = screen;
+        if screen != Screen::Settings {
+            self.last_tab = screen;
+        }
+    }
+
+    fn go_to(&mut self, ui: &Ui, screen: Screen) {
+        if self.screen != screen {
+            self.changed_screen_at = ui.input(|i| i.time);
+            self.screen = screen;
+            if screen != Screen::Settings {
+                self.last_tab = screen;
+            }
+            self.confirm_forget = false;
         }
     }
 
     fn top_bar(&mut self, ui: &mut Ui, engine: &Engine, th: &Tokens) {
-        let title = match self.screen {
+        let heading = match self.screen {
             Screen::Ride => t("Ride"),
             Screen::Route => t("Route"),
             Screen::Voice => t("Voice"),
@@ -328,70 +333,63 @@ impl CompanionApp {
             Screen::Settings => t("Settings"),
         };
         ui.horizontal(|ui| {
-            if self.screen == Screen::Settings {
-                let (rect, response) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
-                let square = Rect::from_center_size(rect.center(), Vec2::splat(24.0));
-                icon(&ui.painter_at(rect), square, "arrow-back", false, th.text);
-                if response.clicked() {
-                    self.screen = self.last_tab;
-                }
+            ui.set_min_height(52.0);
+            if self.screen == Screen::Settings && m3::icon_button(ui, th, "arrow-back", th.text) {
+                self.go_to(ui, self.last_tab);
             }
-            ui.label(text(title, 26.0, th.text, Weight::Bold));
+            ui.label(text(heading, 28.0, th.text, Weight::Bold));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if self.screen != Screen::Settings {
-                    let (rect, response) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
-                    let square = Rect::from_center_size(rect.center(), Vec2::splat(24.0));
-                    icon(&ui.painter_at(rect), square, "settings", false, th.muted);
-                    if response.clicked() {
-                        self.screen = Screen::Settings;
-                    }
+                if self.screen != Screen::Settings && m3::icon_button(ui, th, "settings", th.muted) {
+                    self.go_to(ui, Screen::Settings);
                 }
-                let (label, color) = link_pill(engine, th);
-                let font = FontId::new(12.5, Weight::SemiBold.family());
-                let galley = ui.painter().layout_no_wrap(label.to_string(), font, color);
-                let size = galley.size() + Vec2::new(20.0, 10.0);
-                let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-                let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, CornerRadius::same(12), color.gamma_multiply(0.16));
-                painter.galley(rect.center() - galley.size() / 2.0, galley, color);
+                let (name, color) = link_status(engine, th);
+                m3::status_chip(ui, name, color);
             });
         });
+        if is_connecting(engine) {
+            m3::indeterminate(ui, th);
+        }
     }
 
-    fn problems(ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
-        match engine.bluetooth {
-            BluetoothState::On => {}
-            BluetoothState::Off => {
-                if engine.has_pairing()
-                    && banner(
+    /// Things in the way, shown where they matter and not on every screen.
+    fn problems(&self, ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
+        let on = |screens: &[Screen]| screens.contains(&self.screen);
+        if on(&[Screen::Ride, Screen::Moped]) {
+            match engine.bluetooth {
+                BluetoothState::On => {}
+                BluetoothState::Off => {
+                    if engine.has_pairing()
+                        && m3::banner(
+                            ui,
+                            th,
+                            "bluetooth",
+                            t("Bluetooth is off"),
+                            t("Turn it on so Pillion can reach the moped."),
+                            Some(t("Turn on Bluetooth")),
+                        )
+                    {
+                        engine.enable_bluetooth();
+                    }
+                }
+                BluetoothState::Denied => {
+                    if m3::banner(
                         ui,
                         th,
                         "bluetooth",
-                        t("Bluetooth is off"),
-                        t("Turn it on so Pillion can reach the moped."),
-                        Some(t("Turn on Bluetooth")),
-                    )
-                {
-                    engine.enable_bluetooth();
-                }
-            }
-            BluetoothState::Denied => {
-                if banner(
-                    ui,
-                    th,
-                    "bluetooth",
-                    t("Bluetooth isn't allowed"),
-                    t("Pillion needs the Nearby devices permission to reach the moped."),
-                    Some(t("Open app settings")),
-                ) {
-                    engine.open_app_settings();
+                        t("Bluetooth isn't allowed"),
+                        t("Pillion needs the Nearby devices permission to reach the moped."),
+                        Some(t("Open app settings")),
+                    ) {
+                        engine.open_app_settings();
+                    }
                 }
             }
         }
-        if engine.nav.is_some()
+        if on(&[Screen::Ride, Screen::Route])
+            && engine.nav.is_some()
             && !engine.demo_active
             && !engine.location_on
-            && banner(
+            && m3::banner(
                 ui,
                 th,
                 "target",
@@ -402,50 +400,72 @@ impl CompanionApp {
         {
             engine.open_location_settings();
         }
-        if engine.voice_missing {
-            banner(
+        if on(&[Screen::Voice]) && engine.voice_missing && engine.voice_pack != VoicePack::Ready {
+            m3::banner(
                 ui,
                 th,
                 "alert",
                 t("This phone can't speak yet"),
-                t("It has no working speech engine. Install Speech Services by Google from the Play Store, then reopen Pillion."),
+                t("Install Speech Services by Google from the Play Store, or download the natural voice below."),
                 None,
             );
         }
     }
 
     fn get_ready(ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
-        tonal_card(ui, th, |ui| {
-            ui.label(text(t("Get ready to ride"), 19.0, th.text, Weight::Bold));
-            ui.add_space(2.0);
-            ui.label(text(t("Pillion rides along and tells you what's happening, so your eyes stay on the road."), 14.0, th.muted, Weight::Regular));
+        m3::hero(ui, th, |ui| {
+            ui.label(text(t("Get ready to ride"), 22.0, th.on_accent_soft, Weight::Bold));
+            ui.add_space(4.0);
+            ui.label(text(
+                t("Pillion rides along and tells you what's happening, so your eyes stay on the road."),
+                14.0,
+                th.on_accent_soft,
+                Weight::Regular,
+            ));
         });
-        card(ui, th, |ui| {
-            let pairing = engine.link != Link::Refused;
-            if list_row(
+        m3::card(ui, th, |ui| {
+            let refused = engine.link == Link::Refused;
+            if m3::list_row(
                 ui,
                 th,
                 "moped",
-                if pairing { t("Pair your moped") } else { t("The moped refused this code") },
-                t("Type the 24 characters from its QR sticker. A QR reader app shows them."),
+                if refused { t("The moped refused this code") } else { t("Pair your moped") },
+                t("Use the camera to read the QR sticker on your moped."),
+                true,
             ) {
-                engine.ask_pairing();
+                engine.scan_pairing();
             }
             if !engine.notification_access
-                && list_row(ui, th, "bell", t("Allow notifications"), t("So messages can be read to you and light up the dash."))
+                && m3::list_row(
+                    ui,
+                    th,
+                    "bell",
+                    t("Allow notifications"),
+                    t("So messages can be read to you and light up the dash."),
+                    true,
+                )
             {
                 engine.open_notification_access();
             }
-            if list_row(ui, th, "hearing", t("Test your earpiece"), t("Pillion says a sentence so you know you'll hear it.")) {
+            if m3::list_row(ui, th, "hearing", t("Test your earpiece"), t("Pillion says a sentence so you know you'll hear it."), true) {
                 engine.test_voice();
             }
-            if list_row(ui, th, "play", t("Try a demo ride"), t("See and hear everything first, with invented figures.")) {
+            if m3::list_row(ui, th, "play", t("Try a demo ride"), t("See and hear everything first, with invented figures."), true) {
                 engine.start_demo();
             }
         });
     }
 
     fn ride_screen(&mut self, ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
+        // Not while riding: an update closes the app.
+        let riding = engine.live.as_ref().is_some_and(|l| l.switched_on);
+        if engine.update_state == UpdateState::Available && !riding && !engine.demo_active {
+            let version = engine.update.as_ref().map_or(String::new(), |r| r.version.clone());
+            let detail = tf("Version {} is ready to install.", &[&version]);
+            if m3::banner(ui, th, "refresh", t("Update available"), &detail, Some(t("See what's new"))) {
+                self.go_to(ui, Screen::Settings);
+            }
+        }
         if engine.live.is_none() && !engine.has_pairing() && !engine.demo_active {
             Self::get_ready(ui, engine, th);
         } else if engine.live.is_none() && !engine.demo_active {
@@ -453,62 +473,66 @@ impl CompanionApp {
         }
         // While navigating, the next turn is what a glance is for, so it comes first.
         if let Some(nav) = &engine.nav {
-            Self::next_turn(ui, th, nav);
+            Self::next_turn(ui, th, nav, engine.arrival_time());
         }
         if engine.live.is_some() {
             Self::battery_card(ui, engine, th);
         }
         if engine.nav.is_none() && (engine.has_pairing() || engine.demo_active) {
-            card(ui, th, |ui| {
-                if list_row(ui, th, "route", t("Plan a route"), t("Spoken directions, on roads a moped can use.")) {
-                    self.screen = Screen::Route;
-                    self.last_tab = Screen::Route;
+            m3::card(ui, th, |ui| {
+                if m3::list_row(ui, th, "route", t("Plan a route"), t("Spoken directions, on roads a moped can use."), true) {
+                    self.go_to(ui, Screen::Route);
                 }
             });
         }
         if engine.live.is_some() {
-            card(ui, th, |ui| {
-                let speed = engine.speed_kmh.map_or("--".to_string(), |s| format!("{s:.0}"));
-                let power = engine.power_w().map_or("--".to_string(), |p| tf("{} kW", &[&format!("{:.1}", p / 1000.0)]));
-                stat_row(
-                    ui,
-                    th,
-                    &[
-                        (speed, t("km/h")),
-                        (format_distance(engine.trip.km * 1000.0), t("this ride")),
-                        (tf("{} kWh", &[&format!("{:.2}", engine.trip.kwh)]), t("energy")),
-                        (power, t("power")),
-                    ],
-                );
-            });
+            let speed = engine.speed_kmh.map_or("--".to_string(), |s| format!("{s:.0}"));
+            let power = engine.power_w().map_or("--".to_string(), |p| tf("{} kW", &[&format!("{:.1}", p / 1000.0)]));
+            m3::tile_row(
+                ui,
+                th,
+                &[("moped", speed, t("km/h")), ("route", format_distance(engine.trip.km * 1000.0), t("this ride"))],
+            );
+            m3::tile_row(
+                ui,
+                th,
+                &[
+                    ("battery", tf("{} kWh", &[&format!("{:.2}", engine.trip.kwh)]), t("energy")),
+                    ("bolt", power, t("power")),
+                ],
+            );
             Self::dash_card(ui, engine, th);
         }
         if let Some(said) = engine.spoken.front() {
-            card(ui, th, |ui| {
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
-                    icon(&ui.painter_at(rect), rect, "voice", false, th.accent);
-                    ui.add_space(4.0);
-                    ui.label(text(said.as_str(), 14.0, th.muted, Weight::Regular));
-                });
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                icon(&ui.painter_at(rect), rect, "voice", false, th.accent);
+                ui.label(text(said.as_str(), 13.5, th.muted, Weight::Regular));
             });
         }
+        ui.add_space(FAB_ROOM);
     }
 
     fn battery_card(ui: &mut Ui, engine: &Engine, th: &Tokens) {
         let percent = engine.percent();
-        card(ui, th, |ui| {
+        m3::card(ui, th, |ui| {
             ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(138.0), Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(136.0), Sense::hover());
                 let painter = ui.painter_at(rect);
                 let center = rect.center();
                 let color = match percent {
                     Some(p) if p <= LOW_PERCENT => th.danger,
                     _ => th.accent,
                 };
-                draw_ring(&painter, th, center, 58.0, f32::from(percent.unwrap_or(0)) / 100.0, color);
+                let shown = ui.ctx().animate_value_with_time(
+                    Id::NULL.with("ride-ring"),
+                    f32::from(percent.unwrap_or(0)) / 100.0,
+                    0.7,
+                );
+                draw_ring(&painter, th, center, 56.0, shown, color);
                 let value = percent.map_or("--".to_string(), |p| format!("{p}%"));
-                painter.text(center, Align2::CENTER_CENTER, value, FontId::new(36.0, Weight::Bold.family()), th.text);
+                painter.text(center, Align2::CENTER_CENTER, value, FontId::new(34.0, Weight::Bold.family()), th.text);
                 painter.text(
                     center + Vec2::new(0.0, 45.0),
                     Align2::CENTER_CENTER,
@@ -518,82 +542,115 @@ impl CompanionApp {
                 );
                 ui.add_space(10.0);
                 ui.vertical(|ui| {
+                    ui.add_space(8.0);
                     let range = engine.range_km().map_or("--".to_string(), |r| tf("{} km", &[&format!("{r:.0}")]));
-                    ui.label(text(range, 32.0, th.text, Weight::Bold));
+                    ui.label(text(range, 34.0, th.text, Weight::Bold));
                     let withheld = percent.is_some() && engine.range_km().is_none();
-                    let label = if withheld { t("too low to estimate") } else { t("range left") };
-                    ui.label(text(label, 13.0, th.muted, Weight::Medium));
+                    let caption = if withheld { t("too low to estimate") } else { t("range left") };
+                    ui.label(text(caption, 13.0, th.muted, Weight::Medium));
                     ui.add_space(8.0);
                     let eff = engine.measured_efficiency();
                     let value = eff.map_or("--".to_string(), |e| tf("{} km/kWh", &[&format!("{e:.0}")]));
-                    ui.label(text(value, 19.0, th.text, Weight::Bold));
-                    let label = if eff.is_some() { t("this ride's consumption") } else { t("consumption: measuring") };
-                    ui.label(text(label, 13.0, th.muted, Weight::Medium));
+                    ui.label(text(value, 18.0, th.text, Weight::Bold));
+                    let caption = if eff.is_some() { t("this ride's consumption") } else { t("consumption: measuring") };
+                    ui.label(text(caption, 13.0, th.muted, Weight::Medium));
+                });
+            });
+            let packs = engine.live.as_ref().map(|l| l.packs).filter(|p| p[0].fitted && p[1].fitted);
+            if let Some(packs) = packs {
+                ui.add_space(10.0);
+                ui.columns(2, |c| {
+                    for (i, (column, pack)) in c.iter_mut().zip(packs.iter()).enumerate() {
+                        column.label(text(tf("Battery {}: {}%", &[&(i + 1), &pack.percent]), 13.5, th.text, Weight::SemiBold));
+                        column.add_space(4.0);
+                        m3::progress(
+                            column,
+                            th,
+                            Id::NULL.with(("ride-pack", i)),
+                            f32::from(pack.percent) / 100.0,
+                            charge_color(th, pack.percent, pack.low),
+                            8.0,
+                        );
+                    }
+                });
+            }
+        });
+    }
+
+    fn next_turn(ui: &mut Ui, th: &Tokens, nav: &Navigation, arrival: Option<String>) {
+        m3::hero(ui, th, |ui| {
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(76.0), Sense::hover());
+                let painter = ui.painter_at(rect);
+                painter.circle_filled(rect.center(), 38.0, th.accent);
+                let square = Rect::from_center_size(rect.center(), Vec2::splat(50.0));
+                if nav.off_route {
+                    icon(&painter, square, "alert", true, th.on_accent);
+                } else {
+                    draw_turn(&painter, square, nav.current(), true, th.on_accent);
+                }
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    ui.label(text(format_distance(nav.distance_to_next_m()), 36.0, th.on_accent_soft, Weight::Bold));
+                    if nav.off_route {
+                        ui.label(text(t("Off route, finding a new way"), 15.0, th.on_accent_soft, Weight::Medium));
+                    } else if let Some(m) = nav.current() {
+                        ui.label(text(m.text.as_str(), 15.0, th.on_accent_soft, Weight::Medium));
+                    }
+                    ui.add_space(2.0);
+                    let minutes = format!("{:.0}", (nav.remaining_s() / 60.0).ceil());
+                    let left = format_distance(nav.remaining_m());
+                    let line = match &arrival {
+                        Some(time) => tf("{} to go, {} min, arriving {}", &[&left, &minutes, time]),
+                        None => tf("{} to go, {} min", &[&left, &minutes]),
+                    };
+                    ui.label(text(line, 13.0, th.on_accent_soft, Weight::Regular));
                 });
             });
         });
     }
 
-    fn next_turn(ui: &mut Ui, th: &Tokens, nav: &Navigation) {
-        tonal_card(ui, th, |ui| {
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(76.0), Sense::hover());
-                let color = if nav.off_route { th.warning } else { th.accent };
-                let symbol = if nav.off_route { "alert" } else { turn_symbol(nav.current()) };
-                icon(&ui.painter_at(rect), rect, symbol, true, color);
-                ui.add_space(10.0);
-                ui.vertical(|ui| {
-                    ui.label(text(format_distance(nav.distance_to_next_m()), 34.0, th.text, Weight::Bold));
-                    if nav.off_route {
-                        ui.label(text(t("Off route, finding a new way"), 15.0, th.text, Weight::Medium));
-                    } else if let Some(m) = nav.current() {
-                        ui.label(text(m.text.as_str(), 15.0, th.text, Weight::Medium));
-                    }
-                    ui.add_space(2.0);
-                    let minutes = format!("{:.0}", (nav.remaining_s() / 60.0).ceil());
-                    let line = tf("{} to go, {} min", &[&format_distance(nav.remaining_m()), &minutes]);
-                    ui.label(text(line, 13.0, th.muted, Weight::Medium));
-                });
-            });
+    fn dash_lights(ui: &mut Ui, engine: &Engine, th: &Tokens) {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
+            let lit = engine.flags.ringing();
+            let painter = ui.painter_at(rect);
+            painter.circle_filled(rect.center(), 16.0, if lit { th.accent } else { th.raised });
+            let square = Rect::from_center_size(rect.center(), Vec2::splat(18.0));
+            icon(&painter, square, "call", lit, if lit { th.on_accent } else { th.faint });
+            ui.add_space(6.0);
+            for slot in 0..proto::APP_SLOTS {
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
+                let lit = engine.flags.app_on(slot);
+                ui.painter_at(rect).circle_filled(rect.center(), 12.0, if lit { th.accent } else { th.raised });
+            }
         });
     }
 
     fn dash_card(ui: &mut Ui, engine: &Engine, th: &Tokens) {
-        card(ui, th, |ui| {
-            caption(ui, th, t("Lights on the moped's dash"));
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
-                let lit = engine.flags.ringing();
-                let painter = ui.painter_at(rect);
-                painter.circle_filled(rect.center(), 15.0, if lit { th.accent } else { th.raised });
-                let square = Rect::from_center_size(rect.center(), Vec2::splat(18.0));
-                icon(&painter, square, "call", lit, if lit { th.on_accent } else { th.faint });
-                ui.add_space(6.0);
-                for slot in 0..proto::APP_SLOTS {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
-                    let lit = engine.flags.app_on(slot);
-                    ui.painter_at(rect).circle_filled(rect.center(), 11.0, if lit { th.accent } else { th.raised });
-                }
-            });
+        m3::card(ui, th, |ui| {
+            m3::label(ui, th, t("Lights on the moped's dash"));
+            Self::dash_lights(ui, engine, th);
             if let Some(n) = engine.notifications.front() {
                 ui.add_space(8.0);
-                ui.label(text(format!("{}: {}", n.label, n.title), 14.5, th.text, Weight::SemiBold));
-                ui.label(text(n.text.as_str(), 14.0, th.muted, Weight::Regular));
+                m3::title(ui, th, &format!("{}: {}", n.label, n.title));
+                m3::body(ui, th, n.text.as_str());
             }
         });
     }
 
     fn route_screen(&mut self, ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
-        let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 54.0), Sense::click());
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 56.0), Sense::click());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(27), th.surface);
+        let round = CornerRadius::same(28);
+        painter.rect_filled(rect, round, th.raised);
         if th.outlined {
-            painter.rect_stroke(rect, CornerRadius::same(27), Stroke::new(1.5, th.border), StrokeKind::Inside);
+            painter.rect_stroke(rect, round, Stroke::new(1.5, th.border), egui::StrokeKind::Inside);
         }
         let square = Rect::from_center_size(Pos2::new(rect.left() + 28.0, rect.center().y), Vec2::splat(24.0));
         icon(&painter, square, "search", false, th.muted);
         painter.text(
-            Pos2::new(rect.left() + 52.0, rect.center().y),
+            Pos2::new(rect.left() + 54.0, rect.center().y),
             Align2::LEFT_CENTER,
             t("Where to?"),
             FontId::new(16.0, Weight::Medium.family()),
@@ -602,17 +659,18 @@ impl CompanionApp {
         if response.clicked() {
             engine.ask_search();
         }
-        ui.add_space(10.0);
+        ui.add_space(12.0);
         if !engine.nav_status.is_empty() {
             ui.label(text(engine.nav_status.as_str(), 14.5, th.warning, Weight::Medium));
             ui.add_space(8.0);
         }
         let mut chosen = None;
         if !engine.search_results.is_empty() {
-            card(ui, th, |ui| {
+            m3::card(ui, th, |ui| {
                 for place in &engine.search_results {
                     let (name, detail) = split_place(&place.name);
-                    if list_row(ui, th, "route", name, detail) {
+                    let detail = place_detail(engine.gps, place.at, detail);
+                    if m3::list_row(ui, th, "route", name, &detail, true) {
                         chosen = Some(place.clone());
                     }
                 }
@@ -620,40 +678,41 @@ impl CompanionApp {
         }
         if engine.nav.is_some() {
             if let Some(nav) = &engine.nav {
-                Self::next_turn(ui, th, nav);
+                Self::next_turn(ui, th, nav, engine.arrival_time());
             }
-            Self::route_map(ui, engine, th);
+            self.map_card(ui, engine, th);
             if let Some(nav) = &engine.nav {
-                card(ui, th, |ui| {
-                    caption(ui, th, t("Coming up"));
+                m3::card(ui, th, |ui| {
+                    m3::label(ui, th, t("Coming up"));
                     for m in nav.route.maneuvers.iter().skip(nav.next).take(5) {
                         ui.horizontal(|ui| {
                             let (rect, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
-                            icon(&ui.painter_at(rect), rect, turn_symbol(Some(m)), false, th.muted);
-                            ui.add_space(4.0);
+                            draw_turn(&ui.painter_at(rect), rect, Some(m), false, th.accent);
+                            ui.add_space(6.0);
                             ui.label(text(m.text.as_str(), 14.5, th.text, Weight::Regular));
                         });
-                        ui.add_space(3.0);
+                        ui.add_space(4.0);
                     }
                 });
             }
-            if button(ui, th, t("Stop navigation"), Some("x"), Kind::Danger, 48.0) {
+            if m3::button(ui, th, t("Stop navigation"), Some("x"), Kind::Outlined, 48.0) {
                 engine.stop_navigation();
             }
-            ui.add_space(10.0);
+            ui.add_space(12.0);
         } else if engine.search_results.is_empty() {
             if engine.settings.recents.is_empty() {
-                card(ui, th, |ui| {
-                    ui.label(text(t("Nowhere yet"), 16.0, th.text, Weight::Bold));
+                m3::card(ui, th, |ui| {
+                    m3::headline(ui, th, t("Nowhere yet"));
                     ui.add_space(2.0);
-                    ui.label(text(t("Search for an address or a place. Places you've been will wait here for a quick start."), 14.0, th.muted, Weight::Regular));
+                    m3::body(ui, th, t("Search for an address or a place. Places you've been will wait here for a quick start."));
                 });
             } else {
-                card(ui, th, |ui| {
-                    caption(ui, th, t("Recent places"));
+                m3::card(ui, th, |ui| {
+                    m3::label(ui, th, t("Recent places"));
                     for place in engine.settings.recents.iter().take(MAX_RECENTS_SHOWN) {
                         let (name, detail) = split_place(&place.name);
-                        if list_row(ui, th, "history", name, detail) {
+                        let detail = place_detail(engine.gps, place.at, detail);
+                        if m3::list_row(ui, th, "history", name, &detail, true) {
                             chosen = Some(place.clone());
                         }
                     }
@@ -663,63 +722,163 @@ impl CompanionApp {
         if let Some(place) = chosen {
             engine.navigate_to(&place);
         }
-        ui.label(text(
-            t("Planning a route sends your position and destination to free OpenStreetMap services. Routes and places: © OpenStreetMap contributors"),
-            11.5,
-            th.faint,
-            Weight::Regular,
-        ));
+        m3::small(ui, th, t("Planning a route sends your position and destination to free OpenStreetMap services. Routes and places: © OpenStreetMap contributors"));
     }
 
-    /// The route as a line with a position dot. There's no street map behind it yet.
-    fn route_map(ui: &mut Ui, engine: &Engine, th: &Tokens) {
-        let Some(nav) = &engine.nav else {
+    /// The street map with the route on it. It turns with the rider, or shows the whole route, north up.
+    fn map_card(&mut self, ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
+        let Some(nav) = engine.nav.clone() else {
             return;
         };
-        card(ui, th, |ui| {
-            let size = Vec2::new(ui.available_width(), 180.0);
-            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-            let painter = ui.painter_at(rect);
-            let area = rect.shrink(12.0);
-            let points = &nav.route.points;
-            let (mut lat0, mut lat1, mut lon0, mut lon1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
-            for p in points {
-                lat0 = lat0.min(p.0);
-                lat1 = lat1.max(p.0);
-                lon0 = lon0.min(p.1);
-                lon1 = lon1.max(p.1);
-            }
-            let aspect = ((lat0 + lat1) / 2.0).to_radians().cos();
-            let dx = ((lon1 - lon0) * aspect).max(1e-6);
-            let dy = (lat1 - lat0).max(1e-6);
-            let scale = (f64::from(area.width()) / dx).min(f64::from(area.height()) / dy);
-            let to_screen = |p: (f64, f64)| {
-                area.center()
-                    + Vec2::new(
-                        ((p.1 - (lon0 + lon1) / 2.0) * aspect * scale) as f32,
-                        (((lat0 + lat1) / 2.0 - p.0) * scale) as f32,
-                    )
+        if self.map.dark != th.dark {
+            self.map.dark = th.dark;
+            self.map.tiles.clear();
+            engine.forget_tiles();
+        }
+        let ctx = ui.ctx().clone();
+        for _ in 0..TILES_DECODED_PER_FRAME {
+            let Some((key, path)) = engine.tiles_ready.pop() else {
+                break;
             };
-            let pos = nav.route.along_m.partition_point(|a| *a < nav.along_m).min(points.len() - 1);
-            let travelled: Vec<Pos2> = points[..=pos].iter().map(|p| to_screen(*p)).collect();
-            let ahead: Vec<Pos2> = points[pos..].iter().map(|p| to_screen(*p)).collect();
-            painter.line(travelled, Stroke::new(4.0, th.border));
-            painter.line(ahead, Stroke::new(5.0, th.accent));
+            if let Some(image) = load_tile(&path, th.dark) {
+                if self.map.tiles.len() >= TILES_KEPT {
+                    self.map.tiles.clear();
+                    engine.forget_tiles();
+                }
+                self.map.tiles.insert(key, ctx.load_texture("map", image, TextureOptions::LINEAR));
+            }
+        }
+        if !engine.tiles_ready.is_empty() {
+            ctx.request_repaint();
+        }
+
+        let frame = Frame::new().fill(th.raised).corner_radius(CornerRadius::same(m3::CARD_RADIUS));
+        frame.show(ui, |ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), MAP_HEIGHT), Sense::hover());
+            let painter = ui.painter_at(rect);
+            let points = &nav.route.points;
+
+            // Where to look: the whole route, or just ahead of the rider.
+            let (z, centre_at, anchor, turn) = if self.map.whole_route {
+                let (mut lat0, mut lat1, mut lon0, mut lon1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+                for p in points {
+                    lat0 = lat0.min(p.0);
+                    lat1 = lat1.max(p.0);
+                    lon0 = lon0.min(p.1);
+                    lon1 = lon1.max(p.1);
+                }
+                let mut z = CLOSE_ZOOM;
+                while z > 8 {
+                    let span = map_position((lat0, lon1), z) - map_position((lat1, lon0), z);
+                    if span.x * TILE_POINTS < rect.width() * 0.85 && span.y * TILE_POINTS < rect.height() * 0.85 {
+                        break;
+                    }
+                    z -= 1;
+                }
+                (z, ((lat0 + lat1) / 2.0, (lon0 + lon1) / 2.0), rect.center(), 0.0f32)
+            } else {
+                let z = if engine.speed_kmh.is_some_and(|s| s > FAR_ZOOM_KMH) { FAR_ZOOM } else { CLOSE_ZOOM };
+                let at = engine.gps.unwrap_or(points[nav.index_along()]);
+                let wanted = engine.heading_deg.unwrap_or(0.0) as f32;
+                let gap = (wanted - self.map.heading_deg + 540.0).rem_euclid(360.0) - 180.0;
+                if gap.abs() > 0.5 {
+                    self.map.heading_deg += gap * HEADING_EASE;
+                    ctx.request_repaint();
+                }
+                (z, at, rect.center() + Vec2::new(0.0, rect.height() * 0.24), self.map.heading_deg.to_radians())
+            };
+            let (sin, cos) = (-turn).sin_cos();
+            let centre = map_position(centre_at, z);
+            let to_screen = |p: Vec2| {
+                let d = (p - centre) * TILE_POINTS;
+                anchor + Vec2::new(d.x * cos - d.y * sin, d.x * sin + d.y * cos)
+            };
+
+            // The map pictures that fall inside the card.
+            let reach = (rect.size().length() / TILE_POINTS).ceil() as i32 + 1;
+            let count = 1i64 << z;
+            for dy in -reach..=reach {
+                for dx in -reach..=reach {
+                    let (tx, ty) = (centre.x.floor() as i64 + i64::from(dx), centre.y.floor() as i64 + i64::from(dy));
+                    if tx < 0 || ty < 0 || tx >= count || ty >= count {
+                        continue;
+                    }
+                    let corner = |ox: f32, oy: f32| to_screen(Vec2::new(tx as f32 + ox, ty as f32 + oy));
+                    let quad = [corner(0.0, 0.0), corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0)];
+                    if !Rect::from_points(&quad).intersects(rect) {
+                        continue;
+                    }
+                    let key = (z, tx as u32, ty as u32);
+                    engine.want_tile(key);
+                    if let Some(texture) = self.map.tiles.get(&key) {
+                        let mut mesh = egui::Mesh::with_texture(texture.id());
+                        let uvs = [Pos2::new(0.0, 0.0), Pos2::new(1.0, 0.0), Pos2::new(1.0, 1.0), Pos2::new(0.0, 1.0)];
+                        for (pos, uv) in quad.into_iter().zip(uvs) {
+                            mesh.vertices.push(egui::epaint::Vertex { pos, uv, color: Color32::WHITE });
+                        }
+                        mesh.add_triangle(0, 1, 2);
+                        mesh.add_triangle(0, 2, 3);
+                        painter.add(egui::Shape::mesh(mesh));
+                    }
+                }
+            }
+
+            // The route: what's been ridden fades, and what's ahead stands out.
+            let along = nav.index_along();
+            let line = |part: &[LatLon]| -> Vec<Pos2> { part.iter().map(|p| to_screen(map_position(*p, z))).collect() };
+            painter.line(line(&points[..=along]), Stroke::new(5.0, th.faint));
+            painter.line(line(&points[along..]), Stroke::new(9.0, th.surface));
+            painter.line(line(&points[along..]), Stroke::new(6.0, th.accent));
+            if let Some(m) = nav.current() {
+                let spot = points[m.begin.min(points.len() - 1)];
+                painter.circle(to_screen(map_position(spot, z)), 6.0, th.surface, Stroke::new(3.0, th.accent));
+            }
             if let Some(last) = points.last() {
-                painter.circle_filled(to_screen(*last), 6.0, th.warning);
+                painter.circle(to_screen(map_position(*last, z)), 8.0, th.warning, Stroke::new(3.0, th.surface));
             }
+
+            // The rider, as an arrow pointing the way they're going.
             if let Some(at) = engine.gps {
-                painter.circle(to_screen(at), 7.0, th.accent, Stroke::new(3.0, th.surface));
+                let spot = to_screen(map_position(at, z));
+                let way = if self.map.whole_route { engine.heading_deg.unwrap_or(0.0) as f32 } else { 0.0 };
+                let (s, c) = way.to_radians().sin_cos();
+                let tip = |x: f32, y: f32| spot + Vec2::new(x * c - y * s, x * s + y * c);
+                let arrow = vec![tip(0.0, -15.0), tip(11.0, 11.0), tip(0.0, 5.0), tip(-11.0, 11.0)];
+                painter.circle_filled(spot, 21.0, th.accent.gamma_multiply(0.22));
+                painter.add(egui::Shape::convex_polygon(vec![arrow[0], arrow[1], arrow[2]], th.accent, Stroke::NONE));
+                painter.add(egui::Shape::convex_polygon(vec![arrow[0], arrow[2], arrow[3]], th.accent, Stroke::NONE));
+                painter.add(egui::Shape::closed_line(arrow, Stroke::new(2.0, th.surface)));
             }
+
+            // The switch between following the rider and seeing the whole route.
+            let button = Rect::from_center_size(rect.right_top() + Vec2::new(-34.0, 34.0), Vec2::splat(48.0));
+            let response = ui.interact(button, ui.scope_id().with("map-view"), Sense::click());
+            painter.circle_filled(button.center(), 22.0, th.surface);
+            let glyph = if self.map.whole_route { "target" } else { "route" };
+            icon(&painter, Rect::from_center_size(button.center(), Vec2::splat(24.0)), glyph, false, th.accent);
+            if response.clicked() {
+                self.map.whole_route = !self.map.whole_route;
+            }
+
+            let credit = rect.right_bottom() + Vec2::new(-8.0, -6.0);
+            let font = FontId::new(10.0, Weight::Medium.family());
+            let galley = painter.layout_no_wrap("© OpenStreetMap".to_string(), font, th.muted);
+            let back = Rect::from_min_size(credit - galley.size() - Vec2::splat(3.0), galley.size() + Vec2::splat(6.0));
+            painter.rect_filled(back, CornerRadius::same(4), th.surface.gamma_multiply(0.85));
+            painter.galley(back.min + Vec2::splat(3.0), galley, th.muted);
         });
+        ui.add_space(10.0);
     }
 
     fn voice_screen(ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
-        let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 148.0), Sense::click());
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 156.0), Sense::click());
         let painter = ui.painter_at(rect);
-        let fill = if response.is_pointer_button_down_on() { th.accent.gamma_multiply(0.8) } else { th.accent };
-        painter.rect_filled(rect, CornerRadius::same(CARD_RADIUS), fill);
-        let square = Rect::from_center_size(rect.center() - Vec2::new(0.0, 36.0), Vec2::splat(34.0));
+        let round = CornerRadius::same(28);
+        painter.rect_filled(rect, round, th.accent);
+        if response.is_pointer_button_down_on() {
+            painter.rect_filled(rect, round, th.on_accent.gamma_multiply(0.14));
+        }
+        let square = Rect::from_center_size(rect.center() - Vec2::new(0.0, 40.0), Vec2::splat(38.0));
         icon(&painter, square, "voice", true, th.on_accent);
         painter.text(
             rect.center() + Vec2::new(0.0, 8.0),
@@ -729,7 +888,7 @@ impl CompanionApp {
             th.on_accent,
         );
         painter.text(
-            rect.center() + Vec2::new(0.0, 38.0),
+            rect.center() + Vec2::new(0.0, 40.0),
             Align2::CENTER_CENTER,
             t("Tap here, or press your earpiece's button"),
             FontId::new(13.5, Weight::Medium.family()),
@@ -739,30 +898,39 @@ impl CompanionApp {
             engine.speak_status();
         }
         ui.add_space(10.0);
-        ui.columns(3, |c| {
-            if button(&mut c[0], th, t("Repeat"), Some("refresh"), Kind::Tonal, 48.0) {
-                engine.repeat_last();
-            }
-            if button(&mut c[1], th, t("Slower"), None, Kind::Tonal, 48.0) {
-                engine.change_speech_rate(-SPEECH_RATE_STEP);
-            }
-            if button(&mut c[2], th, t("Faster"), None, Kind::Tonal, 48.0) {
-                engine.change_speech_rate(SPEECH_RATE_STEP);
-            }
-        });
-        ui.add_space(10.0);
-        card(ui, th, |ui| {
+        Self::natural_voice_card(ui, engine, th);
+        m3::card(ui, th, |ui| {
             let on = engine.settings.voice_mode;
-            if switch_row(ui, th, t("Speak to me"), on) {
+            if m3::switch_row(ui, th, t("Speak to me"), on) {
                 engine.set_voice_mode(!on);
             }
             ui.add_space(4.0);
-            if list_row(ui, th, "hearing", t("Test your earpiece"), t("Pillion says a sentence so you know you'll hear it.")) {
+            if m3::button(ui, th, t("Test your earpiece"), Some("hearing"), Kind::Tonal, 46.0) {
                 engine.test_voice();
             }
+            ui.add_space(12.0);
+            let rate = format!("{:.0}%", engine.settings.speech_rate * 100.0);
+            ui.horizontal(|ui| {
+                ui.label(text(t("Speech speed"), 15.5, th.text, Weight::Medium));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(text(rate, 15.5, th.accent, Weight::Bold));
+                });
+            });
+            ui.add_space(6.0);
+            ui.columns(3, |c| {
+                if m3::button(&mut c[0], th, t("Slower"), None, Kind::Outlined, 44.0) {
+                    engine.change_speech_rate(-SPEECH_RATE_STEP);
+                }
+                if m3::button(&mut c[1], th, t("Repeat"), Some("refresh"), Kind::Outlined, 44.0) {
+                    engine.repeat_last();
+                }
+                if m3::button(&mut c[2], th, t("Faster"), None, Kind::Outlined, 44.0) {
+                    engine.change_speech_rate(SPEECH_RATE_STEP);
+                }
+            });
         });
-        card(ui, th, |ui| {
-            caption(ui, th, t("What to tell me about"));
+        m3::card(ui, th, |ui| {
+            m3::label(ui, th, t("What to tell me about"));
             let s = &mut engine.settings;
             let mut changed = false;
             let choices = [
@@ -772,39 +940,264 @@ impl CompanionApp {
                 (t("Calls"), &mut s.say_calls),
             ];
             for (name, value) in choices {
-                if switch_row(ui, th, name, *value) {
+                if m3::switch_row(ui, th, name, *value) {
                     *value = !*value;
                     changed = true;
                 }
             }
             ui.add_space(4.0);
-            ui.label(text(t("Warnings are always spoken. During a call, only directions and warnings are."), 13.0, th.muted, Weight::Regular));
+            m3::small(ui, th, t("Warnings are always spoken. During a call, only directions and warnings are."));
             if changed {
                 engine.save_settings();
             }
         });
-        card(ui, th, |ui| {
-            caption(ui, th, t("Last said"));
+        m3::card(ui, th, |ui| {
+            m3::label(ui, th, t("Last said"));
             if engine.spoken.is_empty() {
-                ui.label(text(t("Nothing yet."), 14.0, th.muted, Weight::Regular));
+                m3::body(ui, th, t("Nothing yet."));
             }
             for said in engine.spoken.iter().take(5) {
                 ui.label(text(said.as_str(), 14.5, th.text, Weight::Regular));
-                ui.add_space(3.0);
+                ui.add_space(4.0);
             }
         });
     }
 
+    fn natural_voice_card(ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
+        m3::card(ui, th, |ui| {
+            m3::label(ui, th, t("Natural voice"));
+            match engine.voice_pack {
+                VoicePack::Ready => {
+                    let on = engine.settings.natural_voice;
+                    if m3::switch_row(ui, th, t("Use the natural voice"), on) {
+                        engine.set_natural_voice(!on);
+                    }
+                    ui.add_space(4.0);
+                    if m3::button(ui, th, t("Remove the voice"), Some("x"), Kind::Outlined, 44.0) {
+                        engine.remove_voice();
+                    }
+                }
+                VoicePack::Downloading(percent) => {
+                    m3::body(ui, th, &tf("Downloading the voice: {}%", &[&percent]));
+                    ui.add_space(6.0);
+                    m3::progress(ui, th, Id::NULL.with("voice-download"), f32::from(percent) / 100.0, th.accent, 8.0);
+                }
+                VoicePack::None | VoicePack::Failed => {
+                    let failed = engine.voice_pack == VoicePack::Failed;
+                    if failed {
+                        ui.label(text(t("The download failed. Check the internet connection."), 14.0, th.warning, Weight::Medium));
+                    } else {
+                        m3::body(ui, th, t("A much clearer voice that runs on the phone, with no internet. It's a single download of about 70 MB, best on Wi-Fi."));
+                    }
+                    ui.add_space(8.0);
+                    let name = if failed { t("Try again") } else { t("Download the voice") };
+                    if m3::button(ui, th, name, Some("voice"), Kind::Filled, 46.0) {
+                        engine.download_voice();
+                    }
+                }
+            }
+        });
+    }
+
+    fn scene(&self, engine: &Engine, th: &Tokens) -> Scene {
+        let live = engine.live.as_ref();
+        let charge = |i: usize| live.filter(|l| l.packs[i].fitted).map(|l| l.packs[i].percent);
+        Scene {
+            yaw: self.model.yaw,
+            pitch: self.model.pitch,
+            zoom: self.model.zoom,
+            seat: self.model.seat,
+            body: match engine.settings.moped_color {
+                MopedColor::Teal => TEAL_BODY,
+                MopedColor::White => WHITE_BODY,
+                MopedColor::Black => BLACK_BODY,
+            },
+            accent: bytes(th.accent),
+            danger: bytes(th.danger),
+            charge: [charge(0), charge(1)],
+            lights_on: live.is_some_and(|l| l.switched_on),
+            warning: live.is_some_and(|l| l.warning != 0),
+        }
+    }
+
+    /// The moped itself: drag to turn, pinch to zoom, double tap to reset, tap a dot for that part.
+    fn model_card(&mut self, ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
+        let frame = Frame::new()
+            .fill(th.surface)
+            .stroke(if th.outlined { Stroke::new(1.5, th.border) } else { Stroke::NONE })
+            .corner_radius(CornerRadius::same(m3::CARD_RADIUS))
+            .inner_margin(Margin::same(0));
+        frame.show(ui, |ui| {
+            let size = Vec2::new(ui.available_width(), MODEL_HEIGHT);
+            let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+            let ctx = ui.ctx().clone();
+
+            if response.dragged() {
+                let delta = response.drag_delta();
+                self.model.target_yaw += delta.x * TURN_PER_POINT;
+                self.model.target_pitch = (self.model.target_pitch + delta.y * TURN_PER_POINT).clamp(-0.05, 1.25);
+            }
+            if response.hovered() || response.dragged() {
+                let pinch = ctx.input(|i| i.zoom_delta());
+                if (pinch - 1.0).abs() > 0.001 {
+                    self.model.zoom = (self.model.zoom * pinch).clamp(ZOOM_LIMITS.0, ZOOM_LIMITS.1);
+                }
+            }
+            if response.double_clicked() {
+                self.model.zoom = 1.0;
+                self.model.select(self.model.focus);
+            }
+
+            let ease = |value: &mut f32, target: f32| {
+                let gap = target - *value;
+                if gap.abs() < SETTLED {
+                    *value = target;
+                    false
+                } else {
+                    *value += gap * CAMERA_EASE;
+                    true
+                }
+            };
+            let dragging = response.dragged();
+            let target_seat = self.model.seat_target();
+            let (target_yaw, target_pitch) = (self.model.target_yaw, self.model.target_pitch);
+            let moving_yaw = ease(&mut self.model.yaw, target_yaw);
+            let moving_pitch = ease(&mut self.model.pitch, target_pitch);
+            let moving_seat = ease(&mut self.model.seat, target_seat);
+            let moving = dragging || moving_yaw || moving_pitch || moving_seat;
+            if moving {
+                ctx.request_repaint();
+            }
+
+            // A lighter picture while it moves, and a crisp one once it rests.
+            let ppp = ctx.pixels_per_point();
+            let longest = rect.width().max(rect.height()) * ppp;
+            let scale = (if moving { MOVING_MAX_PX } else { STILL_MAX_PX } / longest).min(1.0);
+            let width = ((rect.width() * ppp * scale) as usize).max(16);
+            let height = ((rect.height() * ppp * scale) as usize).max(16);
+            let smooth = if moving { 1 } else { 2 };
+            let scene = self.scene(engine, th);
+            let wanted = (scene, width, height, smooth);
+            if self.model.drawn != Some(wanted) {
+                let pixels = model3d::render(&scene, width, height, smooth);
+                let image = egui::ColorImage::from_rgba_premultiplied([width, height], &pixels);
+                match &mut self.model.texture {
+                    Some(texture) => texture.set(image, TextureOptions::LINEAR),
+                    None => self.model.texture = Some(ctx.load_texture("moped", image, TextureOptions::LINEAR)),
+                }
+                self.model.drawn = Some(wanted);
+            }
+            let painter = ui.painter_at(rect);
+            if let Some(texture) = &self.model.texture {
+                let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                painter.image(texture.id(), rect, uv, Color32::WHITE);
+            }
+
+            let aspect = rect.width() / rect.height();
+            let spots = [
+                (Focus::Batteries, model3d::ANCHOR_BATTERIES),
+                (Focus::Motor, model3d::ANCHOR_MOTOR),
+                (Focus::Dash, model3d::ANCHOR_DASH),
+            ];
+            for (focus, anchor) in spots {
+                let Some((x, y)) = model3d::project_point(&scene, anchor, aspect) else {
+                    continue;
+                };
+                let centre = rect.min + Vec2::new(x * rect.width(), y * rect.height());
+                let chosen = self.model.focus == focus;
+                let area = Rect::from_center_size(centre, Vec2::splat(44.0));
+                let spot = ui.interact(area, ui.scope_id().with(("spot", anchor[0].to_bits())), Sense::click());
+                painter.circle_filled(centre, if chosen { 13.0 } else { 11.0 }, th.accent.gamma_multiply(0.28));
+                painter.circle_filled(centre, if chosen { 7.0 } else { 5.5 }, th.accent);
+                painter.circle_stroke(centre, if chosen { 7.0 } else { 5.5 }, Stroke::new(1.5, th.surface));
+                if spot.clicked() {
+                    self.model.select(focus);
+                }
+            }
+
+            let hint = rect.left_bottom() + Vec2::new(14.0, -14.0);
+            painter.text(hint, Align2::LEFT_BOTTOM, t("Drag to turn it. Pinch to zoom."), FontId::new(12.0, Weight::Medium.family()), th.faint);
+        });
+        ui.add_space(10.0);
+    }
+
     fn moped_screen(&mut self, ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
-        Self::connection_card(ui, engine, th, &mut self.confirm_forget);
-        let Some(live) = engine.live.clone() else {
+        if engine.link != Link::Online || engine.demo_active {
+            Self::connection_card(ui, engine, th, &mut self.confirm_forget);
+        }
+        self.model_card(ui, engine, th);
+        ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 38.0), Layout::left_to_right(Align::Center), |ui| {
+            let color = engine.settings.moped_color;
+            if m3::filter_chip(ui, th, t("Teal"), color == MopedColor::Teal) {
+                engine.set_moped_color(MopedColor::Teal);
+            }
+            if m3::filter_chip(ui, th, t("White"), color == MopedColor::White) {
+                engine.set_moped_color(MopedColor::White);
+            }
+            if m3::filter_chip(ui, th, t("Black"), color == MopedColor::Black) {
+                engine.set_moped_color(MopedColor::Black);
+            }
+        });
+        ui.add_space(8.0);
+        let focuses = [Focus::Batteries, Focus::Motor, Focus::Dash];
+        let selected = focuses.iter().position(|f| *f == self.model.focus).unwrap_or(0);
+        if let Some(i) = m3::segmented(ui, th, &[t("Batteries"), t("Motor"), t("Dash")], selected) {
+            self.model.select(focuses[i]);
+        }
+        ui.add_space(10.0);
+        match self.model.focus {
+            Focus::Batteries => Self::batteries_panel(ui, engine, th),
+            Focus::Motor => Self::motor_panel(ui, engine, th),
+            Focus::Dash => {
+                Self::dash_panel(ui, engine, th);
+                Self::about_moped_card(ui, engine, th);
+            }
+        }
+        if !engine.demo_active && engine.link == Link::Online {
+            Self::connection_card(ui, engine, th, &mut self.confirm_forget);
+        }
+        if engine.demo_active && m3::button(ui, th, t("End the demo ride"), Some("x"), Kind::Outlined, 48.0) {
+            engine.stop_demo();
+        }
+    }
+
+    fn batteries_panel(ui: &mut Ui, engine: &Engine, th: &Tokens) {
+        let Some(live) = &engine.live else {
+            m3::card(ui, th, |ui| m3::body(ui, th, t("Connect to the moped to see this.")));
             return;
         };
+        if !live.packs.iter().any(|p| p.fitted) {
+            m3::card(ui, th, |ui| m3::body(ui, th, t("No battery fitted")));
+        }
         for (i, pack) in live.packs.iter().enumerate().filter(|(_, p)| p.fitted) {
-            card(ui, th, |ui| {
-                ui.label(text(tf("Battery {}: {}%", &[&(i + 1), &pack.percent]), 18.0, th.text, Weight::Bold));
+            m3::card(ui, th, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(text(tf("Battery {}", &[&(i + 1)]), 16.0, th.text, Weight::Bold));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(text(format!("{}%", pack.percent), 22.0, charge_color(th, pack.percent, pack.low), Weight::Bold));
+                    });
+                });
+                ui.add_space(6.0);
+                m3::progress(
+                    ui,
+                    th,
+                    Id::NULL.with(("moped-pack", i)),
+                    f32::from(pack.percent) / 100.0,
+                    charge_color(th, pack.percent, pack.low),
+                    10.0,
+                );
+                ui.add_space(12.0);
+                m3::stat_row(
+                    ui,
+                    th,
+                    &[
+                        (format!("{:.1} Ah", pack.remaining_ah), t("stored")),
+                        (format!("{}%", pack.health), t("health")),
+                        (tf("{} h", &[&format!("{:.1}", Engine::charge_hours(pack.percent, pack.health))]), t("to charge")),
+                    ],
+                );
                 ui.add_space(8.0);
-                stat_row(
+                m3::stat_row(
                     ui,
                     th,
                     &[
@@ -813,38 +1206,82 @@ impl CompanionApp {
                         (format!("{:.0} °C", pack.temp_max), t("temperature")),
                     ],
                 );
+                if let (Some(high), Some(low)) = (pack.cell_max_v, pack.cell_min_v) {
+                    ui.add_space(8.0);
+                    m3::stat_row(
+                        ui,
+                        th,
+                        &[
+                            (format!("{high:.2} V"), t("highest cell")),
+                            (format!("{low:.2} V"), t("lowest cell")),
+                            (format!("{} A", pack.limit_discharge_a), t("current limit")),
+                        ],
+                    );
+                }
+            });
+        }
+        for record in &engine.battery_records {
+            m3::card(ui, th, |ui| {
+                m3::label(ui, th, t("Battery history"));
+                ui.label(text(tf("Charged {} times", &[&record.charges]), 16.0, th.text, Weight::Bold));
                 ui.add_space(8.0);
-                stat_row(
+                m3::stat_row(
                     ui,
                     th,
                     &[
-                        (format!("{:.1} Ah", pack.remaining_ah), t("stored")),
-                        (format!("{}%", pack.health), t("health")),
-                        (
-                            tf("{} h", &[&format!("{:.1}", Engine::charge_hours(pack.percent, pack.health))]),
-                            t("to charge"),
-                        ),
+                        (record.normal_charges.to_string(), t("normal")),
+                        (record.slow_charges.to_string(), t("slow")),
+                        (record.fast_charges.to_string(), t("fast")),
                     ],
                 );
+                if !record.started.is_empty() {
+                    ui.add_space(6.0);
+                    m3::small(ui, th, &tf("In use since {}", &[&record.started]));
+                }
             });
         }
-        card(ui, th, |ui| {
-            stat_row(
+        if let Some(full) = engine.full_range_km() {
+            ui.label(text(tf("About {} km on a full charge", &[&format!("{full:.0}")]), 13.5, th.muted, Weight::Medium));
+            ui.add_space(10.0);
+        }
+    }
+
+    fn motor_panel(ui: &mut Ui, engine: &Engine, th: &Tokens) {
+        m3::card(ui, th, |ui| {
+            let Some(live) = &engine.live else {
+                m3::body(ui, th, t("Connect to the moped to see this."));
+                return;
+            };
+            m3::stat_row(
                 ui,
                 th,
                 &[
-                    (format_distance(f64::from(live.odometer_m)), t("odometer")),
-                    (format!("{:.1} V", live.aux_voltage), t("12 V battery")),
                     (format!("{:.0} °C", live.motor_temp), t("motor")),
+                    (format!("{:.0} °C", live.controller_temp), t("controller")),
+                    (live.motor_rpm.to_string(), t("revs")),
                 ],
             );
             ui.add_space(10.0);
-            if let Some(full) = engine.full_range_km() {
-                ui.label(text(tf("About {} km on a full charge", &[&format!("{full:.0}")]), 13.5, th.muted, Weight::Medium));
-                ui.add_space(4.0);
-            }
-            ui.label(text(tf("Model number {}", &[&live.model_number]), 12.5, th.faint, Weight::Regular));
-            ui.add_space(8.0);
+            m3::stat_row(
+                ui,
+                th,
+                &[(format_distance(f64::from(live.odometer_m)), t("odometer")), (format!("{}%", live.throttle), t("throttle"))],
+            );
+        });
+    }
+
+    fn dash_panel(ui: &mut Ui, engine: &Engine, th: &Tokens) {
+        m3::card(ui, th, |ui| {
+            m3::label(ui, th, t("Lights on the moped's dash"));
+            Self::dash_lights(ui, engine, th);
+            let Some(live) = &engine.live else {
+                ui.add_space(8.0);
+                m3::body(ui, th, t("Connect to the moped to see this."));
+                return;
+            };
+            ui.add_space(12.0);
+            m3::stat_row(ui, th, &[(format!("{:.1} V", live.aux_voltage), t("12 V battery"))]);
+            ui.add_space(10.0);
             let errors: Vec<String> = live.active_faults().iter().map(|c| format!("{c:04X}")).collect();
             if live.warning != 0 || !errors.is_empty() {
                 let line = if errors.is_empty() {
@@ -856,45 +1293,77 @@ impl CompanionApp {
             } else {
                 ui.label(text(t("No warnings"), 15.0, th.success, Weight::SemiBold));
             }
+            ui.add_space(4.0);
+            m3::small(ui, th, &tf("Model number {}", &[&live.model_number]));
         });
-        if engine.demo_active && button(ui, th, t("End the demo ride"), Some("x"), Kind::Tonal, 48.0) {
-            engine.stop_demo();
-        }
+    }
+
+    fn about_moped_card(ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
+        m3::card(ui, th, |ui| {
+            if let Some(vehicle) = &engine.vehicle {
+                m3::label(ui, th, t("About this moped"));
+                ui.label(text(vehicle.vin.as_str(), 16.0, th.text, Weight::Bold));
+                m3::small(ui, th, t("Frame number"));
+                ui.add_space(8.0);
+                m3::stat_row(
+                    ui,
+                    th,
+                    &[(vehicle.software.to_string(), t("software")), (vehicle.times_on.to_string(), t("times switched on"))],
+                );
+                ui.add_space(10.0);
+            }
+            let on = engine.recording;
+            if m3::switch_row(ui, th, t("Record what the moped sends"), on) {
+                engine.set_recording(!on);
+            }
+            m3::small(ui, th, t("This helps work out more of its data. The recording includes the frame number, so share it only with someone you trust."));
+            let count = engine.recorded_count();
+            if count > 0 {
+                ui.add_space(8.0);
+                if m3::button(ui, th, &tf("Share the recording ({} messages)", &[&count]), None, Kind::Tonal, 44.0) {
+                    engine.share_recording();
+                }
+            }
+        });
     }
 
     fn connection_card(ui: &mut Ui, engine: &mut Engine, th: &Tokens, confirm_forget: &mut bool) {
         if engine.demo_active {
-            card(ui, th, |ui| {
-                ui.label(text(t("This is a demo ride"), 17.0, th.warning, Weight::Bold));
-                ui.label(text(t("These figures are invented to show the app. They aren't your moped's."), 14.0, th.muted, Weight::Regular));
+            m3::card(ui, th, |ui| {
+                ui.label(text(t("This is a demo ride"), 16.0, th.warning, Weight::Bold));
+                m3::body(ui, th, t("These figures are invented to show the app. They aren't your moped's."));
             });
             return;
         }
-        card(ui, th, |ui| match engine.link {
+        m3::card(ui, th, |ui| match engine.link {
             Link::NeedsPairing | Link::Refused => {
-                let title = if engine.link == Link::Refused { t("The moped refused this code") } else { t("Pair your moped") };
-                ui.label(text(title, 18.0, th.text, Weight::Bold));
+                let heading = if engine.link == Link::Refused { t("The moped refused this code") } else { t("Pair your moped") };
+                m3::headline(ui, th, heading);
                 ui.add_space(4.0);
-                ui.label(text(t("Type the 24 characters from its QR sticker. A QR reader app shows them."), 14.0, th.muted, Weight::Regular));
-                ui.add_space(10.0);
-                if button(ui, th, t("Enter pairing code"), None, Kind::Primary, 48.0) {
+                m3::body(ui, th, t("Use the camera to read the QR sticker on your moped."));
+                ui.add_space(12.0);
+                if m3::button(ui, th, t("Scan the QR code"), Some("target"), Kind::Filled, 48.0) {
+                    engine.scan_pairing();
+                }
+                ui.add_space(6.0);
+                if m3::button(ui, th, t("Type the code instead"), None, Kind::Outlined, 46.0) {
                     engine.ask_pairing();
                 }
                 ui.add_space(6.0);
-                if button(ui, th, t("Try a demo ride"), Some("play"), Kind::Tonal, 44.0) {
+                if m3::button(ui, th, t("Try a demo ride"), Some("play"), Kind::Outlined, 46.0) {
                     engine.start_demo();
                 }
             }
             Link::Idle => {
-                ui.label(text(t("Moped paired"), 18.0, th.text, Weight::Bold));
-                ui.add_space(10.0);
-                if button(ui, th, t("Connect"), Some("bluetooth"), Kind::Primary, 48.0) {
+                m3::headline(ui, th, t("Moped paired"));
+                ui.add_space(12.0);
+                if m3::button(ui, th, t("Connect"), Some("bluetooth"), Kind::Filled, 48.0) {
                     engine.connect();
                 }
                 ui.add_space(6.0);
-                let label = if *confirm_forget { t("Tap again to forget this moped") } else { t("Forget this moped") };
-                let kind = if *confirm_forget { Kind::Danger } else { Kind::Tonal };
-                if button(ui, th, label, None, kind, 44.0) {
+                let name = if *confirm_forget { t("Tap again to forget this moped") } else { t("Forget this moped") };
+                let kind = if *confirm_forget { Kind::Danger } else { Kind::Outlined };
+                if m3::button(ui, th, name, None, kind, 46.0) {
                     if *confirm_forget {
                         engine.forget_moped();
                     }
@@ -907,23 +1376,23 @@ impl CompanionApp {
                     Link::Connecting => t("Connecting to the moped..."),
                     _ => t("Signing in to the moped..."),
                 };
-                ui.label(text(line, 15.5, th.text, Weight::SemiBold));
+                m3::title(ui, th, line);
                 let devices = engine.found_devices.clone();
                 for (name, address) in devices {
                     ui.add_space(6.0);
-                    if button(ui, th, &tf("Use {}", &[&name]), Some("moped"), Kind::Tonal, 44.0) {
+                    if m3::button(ui, th, &tf("Use {}", &[&name]), Some("moped"), Kind::Tonal, 46.0) {
                         engine.choose_device(&address);
                     }
                 }
                 ui.add_space(8.0);
-                if button(ui, th, t("Cancel"), None, Kind::Tonal, 44.0) {
+                if m3::button(ui, th, t("Cancel"), None, Kind::Outlined, 46.0) {
                     engine.disconnect();
                 }
             }
             Link::Online => {
                 ui.label(text(t("Connected to the moped"), 15.5, th.success, Weight::SemiBold));
                 ui.add_space(8.0);
-                if button(ui, th, t("Disconnect"), None, Kind::Tonal, 44.0) {
+                if m3::button(ui, th, t("Disconnect"), None, Kind::Outlined, 46.0) {
                     engine.disconnect();
                 }
             }
@@ -933,7 +1402,7 @@ impl CompanionApp {
     fn alerts_screen(ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
         if !engine.notification_access
             && !engine.demo_active
-            && banner(
+            && m3::banner(
                 ui,
                 th,
                 "bell",
@@ -944,145 +1413,194 @@ impl CompanionApp {
         {
             engine.open_notification_access();
         }
-        card(ui, th, |ui| {
-            caption(ui, th, t("Read notifications aloud"));
+        m3::card(ui, th, |ui| {
+            m3::label(ui, th, t("Read notifications aloud"));
             let levels = [NotifLevel::Off, NotifLevel::AppAndSender, NotifLevel::Full];
             let selected = levels.iter().position(|l| *l == engine.settings.notif_level).unwrap_or(2);
-            if let Some(i) = segmented(ui, th, &[t("Off"), t("Who"), t("Full text")], selected) {
+            if let Some(i) = m3::segmented(ui, th, &[t("Off"), t("Who"), t("Full text")], selected) {
                 engine.settings.notif_level = levels[i];
                 engine.save_settings();
             }
-            ui.add_space(6.0);
-            ui.label(text(t("Several messages in a row from one app are told as a single count."), 13.0, th.muted, Weight::Regular));
+            ui.add_space(8.0);
+            m3::small(ui, th, t("Several messages in a row from one app are told as a single count."));
         });
-        card(ui, th, |ui| {
+        m3::card(ui, th, |ui| {
+            m3::label(ui, th, t("Lights on the moped's dash"));
             let calls = engine.settings.dash_calls;
-            if switch_row(ui, th, t("Show calls on the dash"), calls) {
+            if m3::switch_row(ui, th, t("Show calls on the dash"), calls) {
                 engine.settings.dash_calls = !calls;
                 engine.save_settings();
-            }
-            ui.add_space(6.0);
-            caption(ui, th, t("Apps"));
-            ui.label(text(t("The dash can only light up, it can't show message text. Each app below gets a light, up to six."), 13.0, th.muted, Weight::Regular));
-            ui.add_space(6.0);
-            if engine.apps.is_empty() {
-                ui.label(text(t("Apps appear here after their first notification."), 14.0, th.muted, Weight::Regular));
             }
             let apps = engine.apps.clone();
             for app in apps {
                 let muted = engine.settings.muted_apps.contains(&app.package);
                 let slot = engine.settings.dash_slots.iter().position(|p| *p == app.package);
                 let light = slot.map_or(t("no light").to_string(), |s| tf("light {}", &[&(s + 1)]));
-                if switch_row(ui, th, &format!("{} ({light})", app.label), !muted) {
+                if m3::switch_row(ui, th, &format!("{} ({light})", app.label), !muted) {
                     engine.toggle_app_muted(&app.package);
                 }
             }
+            ui.add_space(4.0);
+            if engine.apps.is_empty() {
+                m3::small(ui, th, t("Apps appear here after their first notification."));
+            }
+            m3::small(ui, th, t("The dash can only light up, it can't show message text. Each app below gets a light, up to six."));
         });
-        card(ui, th, |ui| {
-            caption(ui, th, t("Recent"));
+        m3::card(ui, th, |ui| {
+            m3::label(ui, th, t("Recent"));
             if engine.notifications.is_empty() {
-                ui.label(text(t("Nothing yet."), 14.0, th.muted, Weight::Regular));
+                m3::body(ui, th, t("Nothing yet."));
             }
             for n in engine.notifications.iter().take(8) {
-                ui.label(text(format!("{}: {}", n.label, n.title), 14.5, th.text, Weight::SemiBold));
-                ui.label(text(n.text.as_str(), 14.0, th.muted, Weight::Regular));
-                ui.add_space(4.0);
+                m3::title(ui, th, &format!("{}: {}", n.label, n.title));
+                m3::body(ui, th, n.text.as_str());
+                ui.add_space(6.0);
             }
+        });
+    }
+
+    fn updates_card(ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
+        m3::card(ui, th, |ui| {
+            m3::label(ui, th, t("Updates"));
+            let state = engine.update_state;
+            let install_button = |ui: &mut Ui, engine: &mut Engine| {
+                if m3::button(ui, th, t("Download and install"), Some("refresh"), Kind::Filled, 46.0) {
+                    engine.install_update();
+                }
+            };
+            match state {
+                UpdateState::Idle => {}
+                UpdateState::Checking => m3::body(ui, th, t("Checking...")),
+                UpdateState::UpToDate => {
+                    ui.label(text(t("Pillion is up to date."), 14.0, th.success, Weight::SemiBold));
+                }
+                UpdateState::CheckFailed => {
+                    ui.label(text(t("Couldn't check for updates."), 14.0, th.warning, Weight::Medium));
+                }
+                UpdateState::Available | UpdateState::InstallFailed => {
+                    if state == UpdateState::InstallFailed {
+                        ui.label(text(t("The update didn't install."), 14.0, th.warning, Weight::Medium));
+                    }
+                    if let Some(release) = engine.update.clone() {
+                        m3::title(ui, th, &tf("Version {} is ready to install.", &[&release.version]));
+                        if !release.notes.is_empty() {
+                            ui.add_space(4.0);
+                            m3::body(ui, th, &release.notes);
+                        }
+                        ui.add_space(8.0);
+                        install_button(ui, engine);
+                        ui.add_space(4.0);
+                        m3::small(ui, th, t("Android asks you to confirm, then Pillion closes to update."));
+                    }
+                }
+                UpdateState::Downloading(percent) => {
+                    m3::body(ui, th, &tf("Downloading the update: {}%", &[&percent]));
+                    ui.add_space(6.0);
+                    m3::progress(ui, th, Id::NULL.with("update-download"), f32::from(percent) / 100.0, th.accent, 8.0);
+                }
+                UpdateState::NeedsPermission => {
+                    m3::body(ui, th, t("Android needs your permission for Pillion to install updates. Allow it, come back, and tap below."));
+                    ui.add_space(8.0);
+                    install_button(ui, engine);
+                }
+                UpdateState::Installing => m3::body(ui, th, t("Android asks you to confirm, then Pillion closes to update.")),
+            }
+            let busy = matches!(state, UpdateState::Checking | UpdateState::Downloading(_) | UpdateState::Installing);
+            if !busy {
+                ui.add_space(8.0);
+                if m3::button(ui, th, t("Check for updates"), None, Kind::Outlined, 44.0) {
+                    engine.check_for_update_now();
+                }
+            }
+            ui.add_space(4.0);
+            let auto = engine.settings.update_auto;
+            if m3::switch_row(ui, th, t("Check once a day"), auto) {
+                engine.set_update_auto(!auto);
+            }
+            m3::small(ui, th, t("This only asks GitHub which version is the newest."));
         });
     }
 
     fn settings_screen(ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
-        card(ui, th, |ui| {
-            caption(ui, th, t("Appearance"));
+        m3::card(ui, th, |ui| {
+            m3::label(ui, th, t("Appearance"));
             let modes = [Appearance::System, Appearance::Light, Appearance::Dark];
             let selected = modes.iter().position(|m| *m == engine.settings.appearance).unwrap_or(0);
-            if let Some(i) = segmented(ui, th, &[t("System"), t("Light"), t("Dark")], selected) {
+            if let Some(i) = m3::segmented(ui, th, &[t("System"), t("Light"), t("Dark")], selected) {
                 engine.settings.appearance = modes[i];
                 engine.save_settings();
             }
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             let high = engine.settings.high_contrast;
-            if switch_row(ui, th, t("High contrast"), high) {
+            if m3::switch_row(ui, th, t("High contrast"), high) {
                 engine.settings.high_contrast = !high;
                 engine.save_settings();
             }
         });
-        card(ui, th, |ui| {
-            caption(ui, th, t("Language"));
+        m3::card(ui, th, |ui| {
+            m3::label(ui, th, t("Language"));
             let choices = [None, Some(Lang::En), Some(Lang::It), Some(Lang::Ru)];
             let selected = choices.iter().position(|c| *c == engine.settings.language).unwrap_or(0);
             // Each language is written in itself, so it can be found from any of them.
-            if let Some(i) = segmented(ui, th, &[t("System"), "English", "Italiano", "Русский"], selected) {
+            if let Some(i) = m3::segmented(ui, th, &[t("System"), "English", "Italiano", "Русский"], selected) {
                 engine.set_language(choices[i]);
             }
-            ui.add_space(6.0);
-            ui.label(text(t("Spoken directions follow this too."), 13.0, th.muted, Weight::Regular));
+            ui.add_space(8.0);
+            m3::small(ui, th, t("Spoken directions follow this too."));
         });
-        card(ui, th, |ui| {
-            ui.label(text("Pillion", 20.0, th.text, Weight::Bold));
+        Self::updates_card(ui, engine, th);
+        m3::card(ui, th, |ui| {
+            m3::headline(ui, th, "Pillion");
             ui.label(text(tf("Version {}", &[&env!("CARGO_PKG_VERSION")]), 13.5, th.muted, Weight::Medium));
             ui.add_space(6.0);
-            ui.label(text(t("The seat behind the rider. A companion for your electric moped, part of the Quezka suite."), 14.0, th.muted, Weight::Regular));
+            m3::body(ui, th, t("The seat behind the rider. A companion for your electric moped, part of the Quezka suite."));
             ui.add_space(6.0);
-            ui.label(text(t("Manrope font (SIL Open Font License), Material Symbols (Apache 2.0), routes and places © OpenStreetMap contributors."), 12.0, th.faint, Weight::Regular));
+            m3::small(ui, th, t("Manrope font (SIL Open Font License), Material Symbols (Apache 2.0), routes and places © OpenStreetMap contributors."));
+            ui.add_space(4.0);
+            m3::small(ui, th, t("Natural voices: Piper, run by sherpa-onnx (Apache 2.0) with espeak-ng (GPL 3). Voices: Alba (CC BY 4.0), Paola, Irina."));
         });
     }
 
     fn nav_bar(&mut self, ui: &mut Ui, th: &Tokens) {
-        ui.add_space(6.0);
+        let current = if self.screen == Screen::Settings { self.last_tab } else { self.screen };
+        ui.add_space(4.0);
+        let mut chosen = None;
         ui.columns(5, |c| {
-            for (column, (screen, label, glyph)) in c.iter_mut().zip([
+            for (column, (screen, name, glyph)) in c.iter_mut().zip([
                 (Screen::Ride, t("Ride"), "moped"),
                 (Screen::Route, t("Route"), "route"),
                 (Screen::Voice, t("Voice"), "voice"),
                 (Screen::Moped, t("Moped"), "battery"),
                 (Screen::Alerts, t("Alerts"), "bell"),
             ]) {
-                let selected = self.screen == screen;
-                let size = Vec2::new(column.available_width(), 62.0);
-                let (rect, response) = column.allocate_exact_size(size, Sense::click());
-                let painter = column.painter_at(rect);
-                let pill = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + 18.0), Vec2::new(56.0, 32.0));
-                if selected {
-                    painter.rect_filled(pill, CornerRadius::same(16), th.accent_soft);
-                }
-                let square = Rect::from_center_size(pill.center(), Vec2::splat(24.0));
-                icon(&painter, square, glyph, selected, if selected { th.text } else { th.muted });
-                let weight = if selected { Weight::Bold } else { Weight::Medium };
-                painter.text(
-                    Pos2::new(rect.center().x, rect.top() + 48.0),
-                    Align2::CENTER_CENTER,
-                    label,
-                    FontId::new(12.0, weight.family()),
-                    if selected { th.text } else { th.muted },
-                );
-                if response.clicked() {
-                    self.screen = screen;
-                    self.last_tab = screen;
-                    self.confirm_forget = false;
+                if m3::nav_item(column, th, glyph, name, current == screen) {
+                    chosen = Some(screen);
                 }
             }
         });
+        if let Some(screen) = chosen {
+            self.go_to(ui, screen);
+        }
     }
 
     /// Desktop preview only. On a phone Android's own dialog asks instead, because the on-screen
     /// keyboard doesn't reach this kind of window.
     fn typed_prompt(&mut self, ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
-        let Some((key, title)) = self.typed_key.clone() else {
+        let Some((key, heading)) = self.typed_key.clone() else {
             return;
         };
-        card(ui, th, |ui| {
-            ui.label(text(title, 16.0, th.text, Weight::Bold));
+        m3::card(ui, th, |ui| {
+            m3::title(ui, th, &heading);
             ui.add_space(6.0);
             ui.text_edit_singleline(&mut self.typed);
             ui.add_space(6.0);
             ui.columns(2, |c| {
-                if button(&mut c[0], th, t("OK"), None, Kind::Primary, 40.0) {
+                if m3::button(&mut c[0], th, t("OK"), None, Kind::Filled, 40.0) {
                     engine.on_text(&key, &self.typed);
                     self.typed.clear();
                     self.typed_key = None;
                 }
-                if button(&mut c[1], th, t("Cancel"), None, Kind::Tonal, 40.0) {
+                if m3::button(&mut c[1], th, t("Cancel"), None, Kind::Outlined, 40.0) {
                     self.typed.clear();
                     self.typed_key = None;
                 }
@@ -1090,15 +1608,15 @@ impl CompanionApp {
         });
     }
 
-    pub fn ask_typed(&mut self, key: String, title: String) {
-        self.typed_key = Some((key, title));
+    pub fn ask_typed(&mut self, key: String, heading: String) {
+        self.typed_key = Some((key, heading));
     }
 
     fn message_prompt(ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
-        let Some((title, detail)) = engine.text_prompt.clone() else {
+        let Some((heading, detail)) = engine.text_prompt.clone() else {
             return;
         };
-        if banner(ui, th, "alert", &title, &detail, Some(t("OK"))) {
+        if m3::banner(ui, th, "alert", &heading, &detail, Some(t("OK"))) {
             engine.text_prompt = None;
         }
     }
@@ -1120,16 +1638,37 @@ impl CompanionApp {
             })));
         }
     }
+
+    /// The main action of the Ride screen, within reach of a thumb, and any brief message above the tabs.
+    fn overlays(&mut self, ui: &mut Ui, engine: &mut Engine, th: &Tokens, area: Rect) {
+        let now = ui.input(|i| i.time);
+        if let Some(message) = engine.take_snack() {
+            self.snack = Some((message, now));
+        }
+        let mut lift = 0.0;
+        if let Some((message, since)) = &self.snack {
+            let age = now - since;
+            if age > SNACK_SECONDS {
+                self.snack = None;
+            } else {
+                let fade = (age / 0.2).min((SNACK_SECONDS - age) / 0.3).clamp(0.0, 1.0) as f32;
+                let room = area.shrink2(Vec2::new(14.0, 10.0));
+                m3::snackbar(ui, th, room, message, fade);
+                lift = 62.0;
+                ui.ctx().request_repaint_after_secs(0.05);
+            }
+        }
+        if self.screen == Screen::Ride && (engine.has_pairing() || engine.demo_active) {
+            let corner = area.right_bottom() - Vec2::new(16.0, 14.0 + lift);
+            if m3::extended_fab(ui, th, Id::NULL.with("tell-me"), corner, "voice", t("Tell me")) {
+                engine.speak_status();
+            }
+        }
+    }
 }
 
 fn is_dark(ctx: &egui::Context, engine: &Engine) -> bool {
-    match engine.settings.appearance {
-        Appearance::Light => false,
-        Appearance::Dark => true,
-        Appearance::System => engine.system_dark.unwrap_or_else(|| {
-            ctx.input(|i| i.raw.system_theme).is_none_or(|theme| theme == egui::Theme::Dark)
-        }),
-    }
+    engine.settings_say_dark().unwrap_or_else(|| ctx.input(|i| i.raw.system_theme).is_none_or(|theme| theme == egui::Theme::Dark))
 }
 
 impl eframe::App for CompanionApp {
@@ -1163,7 +1702,7 @@ impl eframe::App for CompanionApp {
                 ui.add_space(bar_bottom / scale);
             });
         Panel::top("title")
-            .frame(Frame::new().fill(th.bg).inner_margin(Margin::symmetric(14, 6)))
+            .frame(Frame::new().fill(th.bg).inner_margin(Margin::symmetric(14, 4)))
             .show_separator_line(false)
             .show(ui, |ui| {
                 ui.add_space(bar_top / scale);
@@ -1172,10 +1711,19 @@ impl eframe::App for CompanionApp {
         CentralPanel::default()
             .frame(Frame::new().fill(th.bg).inner_margin(Margin::symmetric(14, 4)))
             .show(ui, |ui| {
+                let area = ui.max_rect().expand2(Vec2::new(14.0, 4.0));
+                let age = ui.input(|i| i.time) - self.changed_screen_at;
+                let fading = self.changed_screen_at >= 0.0 && age < FADE_SECONDS;
+                if fading {
+                    ui.ctx().request_repaint();
+                }
                 ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    if fading {
+                        ui.set_opacity((age / FADE_SECONDS) as f32);
+                    }
                     self.typed_prompt(ui, &mut engine, &th);
                     Self::message_prompt(ui, &mut engine, &th);
-                    Self::problems(ui, &mut engine, &th);
+                    self.problems(ui, &mut engine, &th);
                     match self.screen {
                         Screen::Ride => self.ride_screen(ui, &mut engine, &th),
                         Screen::Route => self.route_screen(ui, &mut engine, &th),
@@ -1185,6 +1733,10 @@ impl eframe::App for CompanionApp {
                         Screen::Settings => Self::settings_screen(ui, &mut engine, &th),
                     }
                 });
+                self.overlays(ui, &mut engine, &th, area);
             });
+        if m3::take_tap() {
+            engine.tick_haptic();
+        }
     }
 }

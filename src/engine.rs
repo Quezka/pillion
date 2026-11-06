@@ -1,13 +1,25 @@
 //! Everything that keeps running during a ride, with or without a screen. The platform layer feeds
 //! it events through the `on_*` methods and carries out the `Command`s it queues.
 
+use std::collections::HashMap;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
 use crate::demo::DemoRide;
 use crate::locale::{self, t, tf, Lang};
+use crate::update::{self, Release};
 use crate::nav::{self, LatLon, NavEvent, Navigation, Place};
-use crate::protocol::{self as proto, ClockTime, DashFlags, Frame, Live};
+use crate::protocol::{self as proto, ClockTime, DashFlags, Frame, Live, BatteryRecord, Vehicle};
+
+const BATTERY_RECORDS_KEPT: usize = 4;
+const UPDATE_RETRY_S: f64 = 600.0;
+const RECORDED_LIVE_FRAMES: usize = 1500;
+const RECORDED_RARE_FRAMES: usize = 40;
+const TILE_RETRY_S: f64 = 30.0;
+const MOVING_KMH: f64 = 7.0;
+const HEADING_MIN_MOVE_M: f64 = 8.0;
+/// A map picture: zoom level, column, row.
+pub type TileKey = (u8, u32, u32);
 
 const CONNECT_TIMEOUT_S: f64 = 15.0;
 const CLOCK_PERIOD_S: f64 = 1.0;
@@ -46,7 +58,16 @@ pub enum Command {
     SetSpeechRate(f32),
     FetchRoute { url: String, destination: String },
     Search { url: String },
-    AskText { key: String, title: String, hint: String },
+    AskText { key: String, title: String, hint: String, dark: bool },
+    ScanQr { title: String, torch: String, type_it: String, cancel: String },
+    CheckUpdate { url: String },
+    InstallUpdate { url: String, sha256: String },
+    VoiceDownload,
+    VoiceRemove,
+    VoiceNatural(bool),
+    FetchTile { z: u8, x: u32, y: u32 },
+    Share(String),
+    Haptic,
     OpenNotificationAccess,
     SetLanguage(&'static str),
     EnableBluetooth,
@@ -93,6 +114,40 @@ pub enum BluetoothState {
     Denied,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MopedColor {
+    Teal,
+    White,
+    Black,
+}
+
+fn clock_day(time: ClockTime) -> String {
+    format!("{:04}-{:02}-{:02}", time.year, time.month, time.day)
+}
+
+/// Where getting a new version of the app stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    CheckFailed,
+    Available,
+    Downloading(u8),
+    NeedsPermission,
+    Installing,
+    InstallFailed,
+}
+
+/// Where the natural voice for the current language stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoicePack {
+    None,
+    Downloading(u8),
+    Ready,
+    Failed,
+}
+
 #[derive(Clone, Debug)]
 struct NotifBurst {
     package: String,
@@ -120,6 +175,10 @@ pub struct Settings {
     pub total_kwh: f64,
     /// Call lights on the dash. The original has this switch too, off until the rider sets it.
     pub dash_calls: bool,
+    pub moped_color: MopedColor,
+    pub natural_voice: bool,
+    pub update_auto: bool,
+    update_checked_on: String,
     pub appearance: Appearance,
     pub high_contrast: bool,
     /// `None` follows the phone.
@@ -145,6 +204,10 @@ impl Default for Settings {
             total_km: 0.0,
             total_kwh: 0.0,
             dash_calls: true,
+            moped_color: MopedColor::Teal,
+            natural_voice: true,
+            update_auto: true,
+            update_checked_on: String::new(),
             appearance: Appearance::System,
             high_contrast: false,
             language: None,
@@ -164,7 +227,10 @@ impl Settings {
         let mut muted: Vec<&str> = self.muted_apps.iter().map(String::as_str).collect();
         muted.sort_unstable();
         format!(
-            "ccu={}\npass={}\naddr={}\nvoice={}\nbattery={}\nconsumption={}\nnav={}\ncalls={}\nnotif={}\nrate={}\nmuted={}\nslots={}\ntotal_km={}\ntotal_kwh={}\ndash_calls={}\nappearance={}\ncontrast={}\nlanguage={}\n{}",
+            "update_auto={}\nupdate_checked={}\nnatural_voice={}\nccu={}\npass={}\naddr={}\nvoice={}\nbattery={}\nconsumption={}\nnav={}\ncalls={}\nnotif={}\nrate={}\nmuted={}\nslots={}\ntotal_km={}\ntotal_kwh={}\ndash_calls={}\nmoped_color={}\nappearance={}\ncontrast={}\nlanguage={}\n{}",
+            flag(self.update_auto),
+            self.update_checked_on,
+            flag(self.natural_voice),
             self.ccu_id,
             self.passkey,
             self.address,
@@ -180,6 +246,11 @@ impl Settings {
             self.total_km,
             self.total_kwh,
             flag(self.dash_calls),
+            match self.moped_color {
+                MopedColor::Teal => "teal",
+                MopedColor::White => "white",
+                MopedColor::Black => "black",
+            },
             match self.appearance {
                 Appearance::System => "system",
                 Appearance::Light => "light",
@@ -234,6 +305,16 @@ impl Settings {
                 }
                 "contrast" => s.high_contrast = on,
                 "dash_calls" => s.dash_calls = on,
+                "natural_voice" => s.natural_voice = on,
+                "update_auto" => s.update_auto = on,
+                "update_checked" => s.update_checked_on = value.to_string(),
+                "moped_color" => {
+                    s.moped_color = match value {
+                        "black" => MopedColor::Black,
+                        "white" => MopedColor::White,
+                        _ => MopedColor::Teal,
+                    };
+                }
                 "language" => s.language = Lang::from_code(value),
                 "recent" => {
                     let mut parts = value.splitn(3, ';');
@@ -267,6 +348,7 @@ pub struct NotifEntry {
 pub struct Trip {
     start_odometer_m: Option<u32>,
     start_capacity_ah: f64,
+    fitted: [bool; 2],
     pub km: f64,
     pub kwh: f64,
     next_consumption_km: f64,
@@ -297,6 +379,23 @@ pub struct Engine {
     pub system_bars_px: (f32, f32),
     /// The phone has no working speech engine, so nothing can be spoken.
     pub voice_missing: bool,
+    pub voice_pack: VoicePack,
+    pub update_state: UpdateState,
+    /// A daily check that fails isn't worth mentioning, unlike one the rider asked for.
+    update_quietly: bool,
+    update_tried_at: Option<f64>,
+    pub update: Option<Release>,
+    pub vehicle: Option<Vehicle>,
+    pub battery_records: Vec<BatteryRecord>,
+    pub recording: bool,
+    recorded_live: VecDeque<String>,
+    recorded_rare: Vec<String>,
+    /// The way the rider is going, in degrees clockwise from north.
+    pub heading_deg: Option<f64>,
+    last_fix: Option<LatLon>,
+    tiles_asked: HashMap<TileKey, Option<f64>>,
+    /// Map pictures that have arrived, for the screen to pick up.
+    pub tiles_ready: Vec<(TileKey, String)>,
     pub bluetooth: BluetoothState,
     pub location_on: bool,
     /// What the phone itself is set to. `None` where the platform doesn't say.
@@ -304,6 +403,7 @@ pub struct Engine {
     system_language: Option<Lang>,
     spoken_language: Option<Lang>,
     notif_bursts: Vec<NotifBurst>,
+    snack: Option<String>,
     demo: Option<DemoRide>,
     outbox: VecDeque<Command>,
     now: f64,
@@ -382,12 +482,27 @@ impl Engine {
             bad_checksums: 0,
             system_bars_px: (0.0, 0.0),
             voice_missing: false,
+            voice_pack: VoicePack::None,
+            update_state: UpdateState::Idle,
+            update_quietly: false,
+            update_tried_at: None,
+            update: None,
+            vehicle: None,
+            battery_records: Vec::new(),
+            recording: false,
+            recorded_live: VecDeque::new(),
+            recorded_rare: Vec::new(),
+            heading_deg: None,
+            last_fix: None,
+            tiles_asked: HashMap::new(),
+            tiles_ready: Vec::new(),
             bluetooth: BluetoothState::On,
             location_on: true,
             system_dark: None,
             system_language: None,
             spoken_language: None,
             notif_bursts: Vec::new(),
+            snack: None,
             demo: None,
             outbox: VecDeque::new(),
             now: 0.0,
@@ -473,7 +588,10 @@ impl Engine {
     }
 
     pub fn test_voice(&mut self) {
-        self.say(t("This is how I'll sound on your ride. If you can hear me in your earpiece, you're all set."), true);
+        // It speaks even with speaking turned off, or it wouldn't test anything.
+        let text = t("This is how I'll sound on your ride. If you can hear me in your earpiece, you're all set.");
+        self.push(Command::Speak { text: text.to_string(), urgent: true });
+        self.snack = Some(t("Listen for it in your earpiece.").to_string());
     }
 
     pub fn set_notification_access(&mut self, allowed: bool) {
@@ -535,6 +653,7 @@ impl Engine {
         self.save_settings();
         self.set_link(Link::Idle);
         self.connect();
+        self.snack = Some(t("Code saved. Looking for your moped.").to_string());
         true
     }
 
@@ -617,6 +736,9 @@ impl Engine {
     }
 
     pub fn on_rx(&mut self, bytes: &[u8]) {
+        if self.recording {
+            self.record_frame(bytes);
+        }
         let Some(frame) = Frame::parse(bytes) else {
             return;
         };
@@ -640,6 +762,16 @@ impl Engine {
             }
             return;
         }
+        if let Some(vehicle) = proto::parse_vehicle(&frame) {
+            self.vehicle = Some(vehicle);
+            return;
+        }
+        if let Some(record) = proto::parse_battery_record(&frame) {
+            self.battery_records.retain(|r| r.id != record.id);
+            self.battery_records.push(record);
+            self.battery_records.truncate(BATTERY_RECORDS_KEPT);
+            return;
+        }
         if let Some(live) = proto::parse_live(&frame) {
             self.last_rx = self.now;
             if self.link != Link::Online && !self.demo_active {
@@ -649,17 +781,166 @@ impl Engine {
         }
     }
 
+    // ----- Recording what the moped sends -----
+
+    fn record_frame(&mut self, bytes: &[u8]) {
+        let line = format!("{:.2} {}", self.now, proto::to_hex(bytes));
+        if bytes.first() == Some(&proto::START_LIVE) {
+            self.recorded_live.push_back(line);
+            if self.recorded_live.len() > RECORDED_LIVE_FRAMES {
+                self.recorded_live.pop_front();
+            }
+        } else if self.recorded_rare.len() < RECORDED_RARE_FRAMES {
+            self.recorded_rare.push(line);
+        }
+    }
+
+    pub fn recorded_count(&self) -> usize {
+        self.recorded_live.len() + self.recorded_rare.len()
+    }
+
+    pub fn set_recording(&mut self, on: bool) {
+        self.recording = on;
+        if on {
+            self.recorded_live.clear();
+            self.recorded_rare.clear();
+        }
+    }
+
+    pub fn share_recording(&mut self) {
+        let mut text = self.recorded_rare.join("\n");
+        for line in &self.recorded_live {
+            text.push('\n');
+            text.push_str(line);
+        }
+        self.push(Command::Share(text));
+    }
+
+    // ----- New versions of the app -----
+
+    pub fn check_for_update(&mut self) {
+        self.update_state = UpdateState::Checking;
+        self.push(Command::CheckUpdate { url: update::latest_release_url() });
+    }
+
+    /// The rider asked, so they want to know how it went.
+    pub fn check_for_update_now(&mut self) {
+        self.update_quietly = false;
+        self.check_for_update();
+    }
+
+    pub fn set_update_auto(&mut self, on: bool) {
+        self.settings.update_auto = on;
+        self.save_settings();
+    }
+
+    pub fn on_update_reply(&mut self, reply: Result<&str, &str>) {
+        let quiet = std::mem::replace(&mut self.update_quietly, false);
+        if let (Ok(_), Some(time)) = (reply, self.clock) {
+            self.settings.update_checked_on = clock_day(time);
+            self.save_settings();
+        }
+        match reply.map_err(str::to_string).and_then(|json| update::parse_latest(json, env!("CARGO_PKG_VERSION"))) {
+            Ok(Some(release)) => {
+                self.update = Some(release);
+                self.update_state = UpdateState::Available;
+            }
+            Ok(None) => {
+                self.update = None;
+                self.update_state = if quiet { UpdateState::Idle } else { UpdateState::UpToDate };
+            }
+            Err(_) => self.update_state = if quiet { UpdateState::Idle } else { UpdateState::CheckFailed },
+        }
+    }
+
+    pub fn install_update(&mut self) {
+        if let Some(release) = &self.update {
+            let command = Command::InstallUpdate { url: release.url.clone(), sha256: release.sha256.clone() };
+            self.update_state = UpdateState::Downloading(0);
+            self.push(command);
+        }
+    }
+
+    pub fn on_update_state(&mut self, state: UpdateState) {
+        self.update_state = state;
+    }
+
+    // ----- The natural voice -----
+
+    pub fn download_voice(&mut self) {
+        self.voice_pack = VoicePack::Downloading(0);
+        self.push(Command::VoiceDownload);
+    }
+
+    pub fn remove_voice(&mut self) {
+        self.push(Command::VoiceRemove);
+    }
+
+    pub fn set_natural_voice(&mut self, on: bool) {
+        self.settings.natural_voice = on;
+        self.save_settings();
+        self.push(Command::VoiceNatural(on));
+    }
+
+    pub fn on_voice_pack(&mut self, state: VoicePack) {
+        self.voice_pack = state;
+        self.push(Command::VoiceNatural(self.settings.natural_voice));
+    }
+
+    // ----- Map pictures -----
+
+    /// Asks for a map picture once, and again after a while if it failed.
+    pub fn want_tile(&mut self, key: TileKey) {
+        let retry = match self.tiles_asked.get(&key) {
+            None => true,
+            Some(Some(failed_at)) => self.now - failed_at > TILE_RETRY_S,
+            Some(None) => false,
+        };
+        if retry {
+            self.tiles_asked.insert(key, None);
+            self.push(Command::FetchTile { z: key.0, x: key.1, y: key.2 });
+        }
+    }
+
+    pub fn on_tile(&mut self, key: TileKey, path: &str) {
+        self.tiles_ready.push((key, path.to_string()));
+    }
+
+    pub fn on_tile_failed(&mut self, key: TileKey) {
+        self.tiles_asked.insert(key, Some(self.now));
+    }
+
+    /// The map's pictures have to be asked for again, such as after the light or dark look changes.
+    pub fn forget_tiles(&mut self) {
+        self.tiles_asked.clear();
+        self.tiles_ready.clear();
+    }
+
+    /// When the rider should arrive, by the phone's clock.
+    pub fn arrival_time(&self) -> Option<String> {
+        let clock = self.clock?;
+        let nav = self.nav.as_ref()?;
+        let minutes = u32::from(clock.hour) * 60 + u32::from(clock.minute) + (nav.remaining_s() / 60.0).ceil() as u32;
+        Some(format!("{:02}:{:02}", (minutes / 60) % 24, minutes % 60))
+    }
+
     // ----- Battery and consumption -----
 
     fn on_live(&mut self, live: Live) {
         let capacity: f64 = live.packs.iter().filter(|p| p.fitted).map(|p| f64::from(p.remaining_ah)).sum();
+        let fitted = [live.packs[0].fitted, live.packs[1].fitted];
         let riding = self.trip.start_odometer_m.is_some();
-        let charged = riding && capacity > self.trip.start_capacity_ah + 0.05;
-        if charged || (!riding && live.switched_on) {
-            // A ride starts when the main switch is on. A battery that was charged or swapped starts one too.
+        // Taking a battery out isn't energy used, and putting one in or charging isn't energy gained.
+        let batteries_changed = riding && (capacity > self.trip.start_capacity_ah + 0.05 || fitted != self.trip.fitted);
+        if batteries_changed {
+            self.bank_ride();
+        }
+        if batteries_changed || (!riding && live.switched_on) {
+            // A ride starts when the main switch is on.
             self.trip = Trip {
                 start_odometer_m: Some(live.odometer_m),
                 start_capacity_ah: capacity,
+                fitted,
                 km: 0.0,
                 kwh: 0.0,
                 next_consumption_km: CONSUMPTION_EVERY_KM,
@@ -840,6 +1121,16 @@ impl Engine {
         self.ask_text("search", t("Where to?"), t("Address or place"));
     }
 
+    /// Opens the camera on the moped's QR sticker.
+    pub fn scan_pairing(&mut self) {
+        self.push(Command::ScanQr {
+            title: t("Point the camera at the QR sticker on the moped.").to_string(),
+            torch: t("Torch").to_string(),
+            type_it: t("Type it").to_string(),
+            cancel: t("Cancel").to_string(),
+        });
+    }
+
     pub fn ask_pairing(&mut self) {
         self.ask_text("pair", t("Pairing code"), t("24 characters from the QR sticker"));
     }
@@ -849,14 +1140,39 @@ impl Engine {
             key: key.to_string(),
             title: title.to_string(),
             hint: hint.to_string(),
+            dark: self.settings_say_dark().or(self.system_dark).unwrap_or(true),
         });
+    }
+
+    /// Light or dark when the rider has picked one, or `None` when it follows the phone.
+    pub fn settings_say_dark(&self) -> Option<bool> {
+        match self.settings.appearance {
+            Appearance::Light => Some(false),
+            Appearance::Dark => Some(true),
+            Appearance::System => self.system_dark,
+        }
+    }
+
+    /// A small tick from the phone, so a tap can be felt with gloves on.
+    pub fn tick_haptic(&mut self) {
+        self.push(Command::Haptic);
+    }
+
+    pub fn set_moped_color(&mut self, color: MopedColor) {
+        self.settings.moped_color = color;
+        self.save_settings();
+    }
+
+    /// The brief message waiting to be shown, if any.
+    pub fn take_snack(&mut self) -> Option<String> {
+        self.snack.take()
     }
 
     pub fn on_text(&mut self, key: &str, value: &str) {
         match key {
             "search" if !value.trim().is_empty() => {
                 self.nav_status = t("Searching...").to_string();
-                self.push(Command::Search { url: nav::search_request_url(value.trim()) });
+                self.push(Command::Search { url: nav::search_request_url(value.trim(), self.gps) });
             }
             "pair" if !self.set_pairing_code(value) => {
                 self.text_prompt = Some((
@@ -902,8 +1218,10 @@ impl Engine {
         };
         self.route_pending = false;
         self.nav_status = t("Finding a route...").to_string();
+        let moving = self.speed_kmh.is_some_and(|s| s > MOVING_KMH);
+        let heading = self.heading_deg.filter(|_| moving);
         self.push(Command::FetchRoute {
-            url: nav::route_request_url(from, at, self.route_nearby),
+            url: nav::route_request_url(from, at, self.route_nearby, heading),
             destination: name,
         });
     }
@@ -979,6 +1297,15 @@ impl Engine {
 
     pub fn on_gps(&mut self, at: LatLon, speed_mps: Option<f64>) {
         self.gps = Some(at);
+        // Close fixes only show the GPS wobbling, not which way the rider is going.
+        match self.last_fix {
+            Some(last) if nav::distance_m(last, at) < HEADING_MIN_MOVE_M => {}
+            Some(last) => {
+                self.heading_deg = Some(nav::bearing_deg(last, at));
+                self.last_fix = Some(at);
+            }
+            None => self.last_fix = Some(at),
+        }
         self.speed_kmh = speed_mps.map(|s| s * 3.6);
         if self.route_pending {
             self.request_route();
@@ -986,7 +1313,7 @@ impl Engine {
         let Some(nav) = self.nav.as_mut() else {
             return;
         };
-        let events = nav.update(at);
+        let events = nav.update(at, speed_mps);
         for event in events {
             match event {
                 NavEvent::Say { text } => {
@@ -1121,6 +1448,13 @@ impl Engine {
 
     pub fn on_clock(&mut self, time: ClockTime) {
         self.clock = Some(time);
+        // The day only counts as checked once GitHub has answered: the phone may have no signal right now.
+        let waited = self.update_tried_at.is_none_or(|at| self.now - at >= UPDATE_RETRY_S);
+        if self.settings.update_auto && waited && self.update_state == UpdateState::Idle && self.settings.update_checked_on != clock_day(time) {
+            self.update_tried_at = Some(self.now);
+            self.update_quietly = true;
+            self.check_for_update();
+        }
     }
 
     // ----- Voice -----
@@ -1148,7 +1482,15 @@ impl Engine {
     pub fn status_report(&self) -> String {
         let mut parts = Vec::new();
         match self.link {
-            Link::Online => parts.push(self.battery_sentence()),
+            Link::Online => {
+                parts.push(self.battery_sentence());
+                if let Some([first, second]) = self.live.as_ref().map(|l| l.packs).filter(|p| p[0].fitted && p[1].fitted) {
+                    parts.push(tf(
+                        "Battery 1 at {} percent, battery 2 at {} percent.",
+                        &[&first.percent, &second.percent],
+                    ));
+                }
+            }
             Link::NeedsPairing | Link::Refused => parts.push(t("The moped is not paired.").to_string()),
             _ => parts.push(t("The moped is not connected.").to_string()),
         }
@@ -1181,6 +1523,9 @@ impl Engine {
     /// The earpiece's button or a tap in voice mode.
     pub fn speak_status(&mut self) {
         let text = self.status_report();
+        if !self.settings.voice_mode {
+            self.snack = Some(t("Speaking is off. Turn it on to hear this.").to_string());
+        }
         self.say(text, true);
     }
 
@@ -1201,12 +1546,18 @@ impl Engine {
         nav.along_m = crate::demo::START_ALONG_M;
         self.nav = Some(nav);
         self.set_link(Link::Online);
+        let (vehicle, records) = crate::demo::records();
+        for frame in proto::build_records_frames(&vehicle, &records[0], 0).iter().chain(proto::build_records_frames(&vehicle, &records[1], 0).iter()) {
+            self.on_rx(frame);
+        }
         self.tick(self.now);
     }
 
     pub fn stop_demo(&mut self) {
         self.demo = None;
         self.demo_active = false;
+        self.vehicle = None;
+        self.battery_records.clear();
         self.live = None;
         self.trip = Trip::default();
         self.nav = None;
@@ -1221,6 +1572,13 @@ impl Engine {
 
     // ----- Rides -----
 
+    /// Adds what this ride has measured to the running average.
+    fn bank_ride(&mut self) {
+        self.settings.total_km += self.trip.km;
+        self.settings.total_kwh += self.trip.kwh;
+        self.save_settings();
+    }
+
     /// A ride ends once the main switch has been off, or the link down, for a few seconds running.
     fn check_ride_end(&mut self) {
         let switched_on = self.live.as_ref().is_some_and(|l| l.switched_on);
@@ -1234,9 +1592,7 @@ impl Engine {
         }
         self.ride_off_since = None;
         self.trip.start_odometer_m = None;
-        self.settings.total_km += self.trip.km;
-        self.settings.total_kwh += self.trip.kwh;
-        self.save_settings();
+        self.bank_ride();
         if self.settings.say_consumption {
             if let Some(eff) = self.measured_efficiency() {
                 let text = tf(
@@ -1350,6 +1706,60 @@ mod tests {
     }
 
     #[test]
+    fn a_new_version_is_offered_and_a_quiet_check_stays_quiet_when_it_fails() {
+        let mut e = Engine::new();
+        e.check_for_update();
+        e.update_quietly = true;
+        e.on_update_reply(Err("offline"));
+        assert_eq!(e.update_state, UpdateState::Idle);
+        e.check_for_update_now();
+        e.on_update_reply(Err("offline"));
+        assert_eq!(e.update_state, UpdateState::CheckFailed);
+        let reply = r#"{"tag_name":"v99.0.0","assets":[{"name":"Pillion-99.0.0.apk","browser_download_url":"https://example.org/a.apk"}]}"#;
+        e.check_for_update_now();
+        e.on_update_reply(Ok(reply));
+        assert_eq!(e.update_state, UpdateState::Available);
+        assert_eq!(e.update.as_ref().unwrap().version, "99.0.0");
+        while e.poll_command().is_some() {}
+        e.install_update();
+        assert!(matches!(e.poll_command(), Some(Command::InstallUpdate { .. })));
+    }
+
+    #[test]
+    fn the_app_looks_for_a_new_version_once_a_day() {
+        let mut e = Engine::new();
+        let day = |day| ClockTime { year: 2026, month: 11, day, hour: 9, minute: 0, second: 0 };
+        let checks = |e: &mut Engine| {
+            let mut count = 0;
+            while let Some(command) = e.poll_command() {
+                count += usize::from(matches!(command, Command::CheckUpdate { .. }));
+            }
+            count
+        };
+        e.on_clock(day(6));
+        assert_eq!(checks(&mut e), 1);
+        // No signal: it waits a while, then tries again.
+        e.on_update_reply(Err("offline"));
+        e.on_clock(day(6));
+        assert_eq!(checks(&mut e), 0);
+        e.now += UPDATE_RETRY_S;
+        e.on_clock(day(6));
+        assert_eq!(checks(&mut e), 1);
+        // An answer settles it for the day.
+        e.on_update_reply(Ok(r#"{"tag_name":"v0.0.1","assets":[]}"#));
+        assert_eq!(e.update_state, UpdateState::Idle);
+        e.now += UPDATE_RETRY_S;
+        e.on_clock(day(6));
+        assert_eq!(checks(&mut e), 0);
+        e.on_clock(day(7));
+        assert_eq!(checks(&mut e), 1);
+        e.on_update_reply(Ok(r#"{"tag_name":"v0.0.1","assets":[]}"#));
+        e.set_update_auto(false);
+        e.on_clock(day(8));
+        assert_eq!(checks(&mut e), 0);
+    }
+
+    #[test]
     fn connection_runs_the_original_sequence() {
         let mut e = Engine::new();
         assert_eq!(e.link, Link::NeedsPairing);
@@ -1436,6 +1846,65 @@ mod tests {
         limited.output_limited = true;
         feed(&mut e, &limited);
         assert_eq!(e.range_km(), None);
+    }
+
+    #[test]
+    fn taking_a_battery_out_is_not_counted_as_energy_used() {
+        let mut e = online();
+        let mut two = live(80, 10_000);
+        two.packs[1] = pack(100, 20.0);
+        feed(&mut e, &two);
+        // 3 km on 1 Ah from the first battery.
+        two.odometer_m = 13_000;
+        two.packs[0].remaining_ah -= 1.0;
+        feed(&mut e, &two);
+        assert!((e.trip.kwh - 0.05).abs() < 0.005);
+        // The second battery comes out, taking 20 Ah with it.
+        let mut one = two.clone();
+        one.packs[1] = Pack::default();
+        one.odometer_m = 13_100;
+        feed(&mut e, &one);
+        assert_eq!(e.trip.km, 0.0);
+        assert_eq!(e.trip.kwh, 0.0);
+        assert!((e.settings.total_km - 3.0).abs() < 0.01);
+        assert!((e.settings.total_kwh - 0.05).abs() < 0.005);
+        assert!((e.efficiency() - 60.0).abs() < 7.0);
+    }
+
+    #[test]
+    fn putting_a_battery_in_keeps_the_ride_so_far_in_the_average() {
+        let mut e = online();
+        feed(&mut e, &live(80, 10_000));
+        let mut after = live(70, 13_000);
+        after.packs[0].remaining_ah = 14.0;
+        feed(&mut e, &after);
+        after.packs[1] = pack(100, 20.0);
+        feed(&mut e, &after);
+        assert_eq!(e.trip.km, 0.0);
+        assert!((e.settings.total_km - 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn status_report_names_each_of_two_batteries() {
+        let mut e = online();
+        let mut two = live(30, 1000);
+        two.packs[1] = pack(90, 20.0);
+        feed(&mut e, &two);
+        let report = e.status_report();
+        assert!(report.contains("Battery 60 percent"));
+        assert!(report.contains("Battery 1 at 30 percent, battery 2 at 90 percent."));
+        feed(&mut e, &live(30, 1000));
+        assert!(!e.status_report().contains("battery 2"));
+    }
+
+    #[test]
+    fn a_low_second_battery_alone_is_still_announced() {
+        let mut e = online();
+        let mut two = live(90, 1000);
+        two.packs[1] = pack(10, 20.0);
+        two.packs[1].low = true;
+        feed(&mut e, &two);
+        assert!(speech(&mut e).iter().any(|s| s == "Battery low."));
     }
 
     #[test]
@@ -1718,6 +2187,7 @@ mod tests {
     #[test]
     fn clock_then_flags_go_out_every_second_while_online() {
         let mut e = online();
+        e.settings.update_auto = false;
         e.on_clock(ClockTime { year: 2026, month: 1, day: 2, hour: 3, minute: 4, second: 5 });
         e.tick(100.0);
         let Some(Command::Write(clock)) = e.poll_command() else {
@@ -1765,8 +2235,7 @@ mod tests {
             text: text.to_string(),
             spoken_before: text.to_string(),
             spoken_at: text.to_string(),
-            begin,
-        };
+            begin, ..Default::default() };
         Route::new("Home", points, vec![m(1, 0, "Go north"), m(4, 20, "Arrive")], 300.0)
     }
 
@@ -1909,10 +2378,28 @@ mod tests {
     }
 
     #[test]
-    fn test_voice_speaks_even_before_pairing() {
+    fn test_voice_speaks_even_before_pairing_and_with_speaking_off() {
         let mut e = Engine::new();
         e.test_voice();
         assert_eq!(speech(&mut e).len(), 1);
+        assert!(e.take_snack().is_some());
+        assert!(e.take_snack().is_none());
+        e.settings.voice_mode = false;
+        e.test_voice();
+        assert_eq!(speech(&mut e).len(), 1);
+    }
+
+    #[test]
+    fn asking_with_speaking_off_explains_the_silence() {
+        let mut e = online();
+        e.settings.voice_mode = false;
+        e.speak_status();
+        assert!(speech(&mut e).is_empty());
+        assert!(e.take_snack().is_some());
+        e.settings.voice_mode = true;
+        e.speak_status();
+        assert_eq!(speech(&mut e).len(), 1);
+        assert!(e.take_snack().is_none());
     }
 
     #[test]
@@ -1941,6 +2428,7 @@ mod tests {
         s.muted_apps.insert("a.b".to_string());
         s.dash_slots = vec!["c.d".to_string(), "e.f".to_string()];
         s.appearance = Appearance::Dark;
+        s.moped_color = MopedColor::Black;
         s.high_contrast = true;
         s.language = Some(Lang::It);
         s.recents = vec![Place { name: "Home; sweet, home".to_string(), at: (48.5, 16.25) }];
@@ -1954,6 +2442,7 @@ mod tests {
         assert!(back.muted_apps.contains("a.b"));
         assert_eq!(back.dash_slots.len(), 2);
         assert_eq!(back.appearance, Appearance::Dark);
+        assert_eq!(back.moped_color, MopedColor::Black);
         assert!(back.high_contrast);
         assert_eq!(back.language, Some(Lang::It));
         assert_eq!(back.recents[0].name, "Home; sweet, home");
