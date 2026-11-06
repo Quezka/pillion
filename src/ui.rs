@@ -1558,6 +1558,8 @@ impl CompanionApp {
             m3::small(ui, th, t("Manrope font (SIL Open Font License), Material Symbols (Apache 2.0), routes and places © OpenStreetMap contributors."));
             ui.add_space(4.0);
             m3::small(ui, th, t("Natural voices: Piper, run by sherpa-onnx (Apache 2.0) with espeak-ng (GPL 3). Voices: Alba (CC BY 4.0), Paola, Irina."));
+            ui.add_space(4.0);
+            m3::small(ui, th, t("Copyright © 2026 Quezka. Free software under the GNU GPL version 3, with no warranty. Licence, notices and source code: github.com/Quezka/pillion"));
         });
     }
 

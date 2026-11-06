@@ -23,6 +23,12 @@ Not yet tried on a real moped.
 The logic is Rust (`src/`), the same on the desktop and the phone, and the Android side (`android/java/`) carries out its commands.
 `MECHANICS.md` holds what's known about how the moped talks and where each fact was read.
 
+## Licence
+
+Pillion is free software under the GNU General Public License version 3 only, with no warranty: see `LICENSE`. Copyright (C) 2026
+Quezka. The parts it's built with keep their own licences, listed in `THIRD_PARTY_NOTICES.txt`; after changing dependencies, run
+`python3 tools/make_notices.py`, or the release build stops. Pillion isn't affiliated with or endorsed by Yamaha.
+
 ## Release
 
 Bump `version` in `Cargo.toml`, add a `CHANGELOG.md` section, then push a tag `vX.Y.Z`. CI tests, builds and publishes the signed APK.

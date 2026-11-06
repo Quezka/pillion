@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.1] - 2026-11-06
+
+- Pillion is now free software under the GNU GPL version 3. The app says so in Settings and carries the licence and the notices for
+  everything it's built with.
+- Each release now includes the source code of the speech engine.
+
 ## [0.2.0] - 2026-11-06
 
 - Updates from GitHub: Pillion looks for a new version once a day, and installs it when you say so.

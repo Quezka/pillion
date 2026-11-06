@@ -27,6 +27,8 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;$NDK_VERSION" > /dev/null
           rustup target add aarch64-linux-android x86_64-linux-android
+      - name: Check the licence notices are up to date
+        run: python3 tools/make_notices.py --check
       - uses: actions/cache@v4
         with:
           path: |
@@ -59,4 +61,9 @@ jobs:
           m = re.search(r'^## \[' + re.escape(sys.argv[1]) + r'\][^\n]*\n(.*?)(?=^## \[|\Z)', text, re.S | re.M)
           print(m.group(1).strip() if m else '')
           PY
-          gh release create "$GITHUB_REF_NAME" "Pillion-$version.apk" --title "Pillion $version" --notes-file notes.md
+          # The speech engine in the APK includes GPL code, so its source goes out with it. The pins match build_android.sh's version.
+          curl -fsSL -o sherpa-onnx-1.13.8-source.tar.gz https://github.com/k2-fsa/sherpa-onnx/archive/refs/tags/v1.13.8.tar.gz
+          curl -fsSL -o espeak-ng-ed530aa-source.zip https://github.com/csukuangfj/espeak-ng/archive/ed530aa113046142eb5115cf2fc9157854d0ffe1.zip
+          echo "e4e262cbe34f7fe21f91f1ba3397f2728e1f30eafbae7853f2b753a9ed13f0dd  espeak-ng-ed530aa-source.zip" | sha256sum -c
+          curl -fsSL -o piper-phonemize-f3ff95a-source.zip https://github.com/csukuangfj/piper-phonemize/archive/f3ff95afc03640bc1399e113e83361192a2fafb4.zip
+          gh release create "$GITHUB_REF_NAME" "Pillion-$version.apk" sherpa-onnx-1.13.8-source.tar.gz espeak-ng-ed530aa-source.zip piper-phonemize-f3ff95a-source.zip --title "Pillion $version" --notes-file notes.md

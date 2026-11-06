@@ -82,7 +82,9 @@ javac -nowarn -Xlint:-options --release 8 -classpath "$PLATFORM_JAR" -d "$OUT/cl
 
 (
     cd "$OUT/apk"
-    "$BUILD_TOOLS/aapt" add unsigned.apk classes.dex $(find lib -name '*.so') >/dev/null
+    mkdir -p assets
+    cp "$APP/LICENSE" "$APP/THIRD_PARTY_NOTICES.txt" assets/
+    "$BUILD_TOOLS/aapt" add unsigned.apk classes.dex $(find lib -name '*.so') assets/LICENSE assets/THIRD_PARTY_NOTICES.txt >/dev/null
 )
 "$BUILD_TOOLS/zipalign" -f -p 4 "$OUT/apk/unsigned.apk" "$OUT/aligned.apk"
 

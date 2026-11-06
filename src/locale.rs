@@ -275,6 +275,7 @@ const MESSAGES: &[(&str, &str, &str)] = &[
     ("Version {}", "Versione {}", "Версия {}"),
     ("The seat behind the rider. A companion for your electric moped, part of the Quezka suite.", "Il sellino del passeggero. Un compagno per il tuo motorino elettrico, parte della suite Quezka.", "Сиденье позади водителя. Спутник для вашего электромопеда из набора приложений Quezka."),
     ("Manrope font (SIL Open Font License), Material Symbols (Apache 2.0), routes and places © OpenStreetMap contributors.", "Font Manrope (SIL Open Font License), Material Symbols (Apache 2.0), percorsi e luoghi © OpenStreetMap contributors.", "Шрифт Manrope (SIL Open Font License), Material Symbols (Apache 2.0), маршруты и места © OpenStreetMap contributors."),
+    ("Copyright © 2026 Quezka. Free software under the GNU GPL version 3, with no warranty. Licence, notices and source code: github.com/Quezka/pillion", "Copyright © 2026 Quezka. Software libero sotto la GNU GPL versione 3, senza alcuna garanzia. Licenza, note e codice sorgente: github.com/Quezka/pillion", "Copyright © 2026 Quezka. Свободное ПО по лицензии GNU GPL версии 3, без каких-либо гарантий. Лицензия, уведомления и исходный код: github.com/Quezka/pillion"),
     ("OK", "OK", "ОК"),
     ("Updates", "Aggiornamenti", "Обновления"),
     ("Update available", "Aggiornamento disponibile", "Доступно обновление"),
