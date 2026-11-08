@@ -1,6 +1,12 @@
 //! The phone screens, in the suite's Material 3 look. All of them read from and act on the shared `Engine`.
 
-use std::collections::HashMap;
+
+mod map;
+pub mod m3;
+pub mod model3d;
+pub(crate) mod symbols;
+pub mod theme;
+
 use std::f32::consts::PI;
 use std::sync::{Arc, Mutex};
 
@@ -9,13 +15,13 @@ use eframe::egui::{
     Rect, ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2,
 };
 
-use crate::engine::{Appearance, BluetoothState, Engine, Link, MopedColor, NotifLevel, TileKey, UpdateState, VoicePack};
+use crate::engine::{Appearance, BluetoothState, Engine, Link, MopedColor, NotifLevel, UpdateState, VoicePack};
 use crate::locale::{self, t, tf, Lang};
-use crate::m3::{self, text, Kind};
-use crate::model3d::{self, Scene};
-use crate::nav::{self, LatLon, Maneuver, Navigation};
+use m3::{text, Kind};
+use model3d::Scene;
+use crate::nav::{Maneuver, Navigation};
 use crate::protocol as proto;
-use crate::theme::{self, icon, Tokens, Weight};
+use theme::{icon, Tokens, Weight};
 
 const LOW_PERCENT: u8 = 20;
 const REPAINT_SECONDS: f32 = 0.25;
@@ -40,15 +46,6 @@ const WHITE_BODY: [u8; 3] = [236, 236, 232];
 const BLACK_BODY: [u8; 3] = [38, 38, 44];
 const TEAL_BODY: [u8; 3] = [22, 190, 195];
 
-const MAP_HEIGHT: f32 = 320.0;
-const TILE_POINTS: f32 = 256.0;
-const CLOSE_ZOOM: u8 = 17;
-const FAR_ZOOM: u8 = 16;
-/// Above this speed the map looks further ahead.
-const FAR_ZOOM_KMH: f64 = 28.0;
-const TILES_DECODED_PER_FRAME: usize = 3;
-const TILES_KEPT: usize = 60;
-const HEADING_EASE: f32 = 0.12;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -138,43 +135,7 @@ pub struct CompanionApp {
     changed_screen_at: f64,
     snack: Option<(String, f64)>,
     model: ModelView,
-    map: MapView,
-}
-
-/// The street map: pictures of it, and how it's looking at the route.
-#[derive(Default)]
-struct MapView {
-    tiles: HashMap<TileKey, TextureHandle>,
-    dark: bool,
-    whole_route: bool,
-    heading_deg: f32,
-}
-
-/// A position in map pictures, at a zoom level. North is up.
-fn map_position(at: LatLon, z: u8) -> Vec2 {
-    let n = f64::from(1u32 << z);
-    let x = (at.1 + 180.0) / 360.0 * n;
-    let lat = at.0.to_radians();
-    let y = (1.0 - lat.tan().asinh() / std::f64::consts::PI) / 2.0 * n;
-    Vec2::new(x as f32, y as f32)
-}
-
-/// Loads a map picture. The dark look turns it into a night map, keeping its roads readable.
-fn load_tile(path: &str, dark: bool) -> Option<egui::ColorImage> {
-    let bytes = std::fs::read(path).ok()?;
-    let picture = resvg::tiny_skia::Pixmap::decode_png(&bytes).ok()?;
-    let (w, h) = (picture.width() as usize, picture.height() as usize);
-    let mut pixels: Vec<u8> = picture.take();
-    if dark {
-        for p in pixels.chunks_mut(4) {
-            let grey = (u16::from(p[0]) * 3 + u16::from(p[1]) * 6 + u16::from(p[2])) / 10;
-            let night = 255 - grey as u8;
-            p[0] = (f32::from(night) * 0.62 + f32::from(p[0]) * 0.06) as u8;
-            p[1] = (f32::from(night) * 0.64 + f32::from(p[1]) * 0.06) as u8;
-            p[2] = (f32::from(night) * 0.74 + f32::from(p[2]) * 0.06) as u8;
-        }
-    }
-    Some(egui::ColorImage::from_rgba_premultiplied([w, h], &pixels))
+    map: map::MapView,
 }
 
 struct ScreenshotJob {
@@ -242,28 +203,14 @@ fn link_status(engine: &Engine, th: &Tokens) -> (&'static str, Color32) {
         Link::Connecting | Link::LoggingIn => (t("Connecting"), th.muted),
         Link::Refused => (t("Code refused"), th.danger),
         Link::Idle => (t("Not connected"), th.muted),
+        Link::Waiting => (t("Waiting for the moped"), th.muted),
+        Link::NotFound => (t("Moped not found"), th.warning),
         Link::NeedsPairing => (t("Not paired"), th.muted),
     }
 }
 
 fn is_connecting(engine: &Engine) -> bool {
     !engine.demo_active && matches!(engine.link, Link::Scanning | Link::Connecting | Link::LoggingIn)
-}
-
-/// Places come with long addresses. The first part is the name, the rest says where.
-fn split_place(name: &str) -> (&str, &str) {
-    match name.split_once(", ") {
-        Some((first, rest)) => (first, rest),
-        None => (name, ""),
-    }
-}
-
-/// How far a place is from the rider, then where it is.
-fn place_detail(from: Option<LatLon>, at: LatLon, detail: &str) -> String {
-    match from {
-        Some(from) => format!("{}, {detail}", format_distance(nav::distance_m(from, at))),
-        None => detail.to_string(),
-    }
 }
 
 fn charge_color(th: &Tokens, percent: u8, low: bool) -> Color32 {
@@ -292,7 +239,7 @@ impl CompanionApp {
             changed_screen_at: -1.0,
             snack: None,
             model: ModelView::new(),
-            map: MapView::default(),
+            map: map::MapView::default(),
         }
     }
 
@@ -485,6 +432,9 @@ impl CompanionApp {
                 }
             });
         }
+        if let Some(limit) = engine.limits.limit() {
+            Self::limit_card(ui, engine, th, limit);
+        }
         if engine.live.is_some() {
             let speed = engine.speed_kmh.map_or("--".to_string(), |s| format!("{s:.0}"));
             let power = engine.power_w().map_or("--".to_string(), |p| tf("{} kW", &[&format!("{:.1}", p / 1000.0)]));
@@ -639,235 +589,26 @@ impl CompanionApp {
         });
     }
 
-    fn route_screen(&mut self, ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
-        let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 56.0), Sense::click());
-        let painter = ui.painter_at(rect);
-        let round = CornerRadius::same(28);
-        painter.rect_filled(rect, round, th.raised);
-        if th.outlined {
-            painter.rect_stroke(rect, round, Stroke::new(1.5, th.border), egui::StrokeKind::Inside);
-        }
-        let square = Rect::from_center_size(Pos2::new(rect.left() + 28.0, rect.center().y), Vec2::splat(24.0));
-        icon(&painter, square, "search", false, th.muted);
-        painter.text(
-            Pos2::new(rect.left() + 54.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            t("Where to?"),
-            FontId::new(16.0, Weight::Medium.family()),
-            th.muted,
-        );
-        if response.clicked() {
-            engine.ask_search();
-        }
-        ui.add_space(12.0);
-        if !engine.nav_status.is_empty() {
-            ui.label(text(engine.nav_status.as_str(), 14.5, th.warning, Weight::Medium));
-            ui.add_space(8.0);
-        }
-        let mut chosen = None;
-        if !engine.search_results.is_empty() {
-            m3::card(ui, th, |ui| {
-                for place in &engine.search_results {
-                    let (name, detail) = split_place(&place.name);
-                    let detail = place_detail(engine.gps, place.at, detail);
-                    if m3::list_row(ui, th, "route", name, &detail, true) {
-                        chosen = Some(place.clone());
-                    }
-                }
+    /// The speed limit of the road the rider is on, as a road sign, with the road's name and the speed now.
+    fn limit_card(ui: &mut Ui, engine: &Engine, th: &Tokens, limit: u32) {
+        let over = engine.speed_kmh.is_some_and(|s| s > f64::from(limit) + 2.0);
+        m3::card(ui, th, |ui| {
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
+                map::speed_sign(&ui.painter_at(rect), rect.center(), 30.0, limit);
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    let road = engine.limits.road().map(|r| r.name.clone()).unwrap_or_default();
+                    ui.label(text(if road.is_empty() { t("Speed limit") } else { road.as_str() }, 17.0, th.text, Weight::Bold));
+                    let (line, ink) = if over {
+                        (t("You're going faster than the limit."), th.danger)
+                    } else {
+                        (t("From OpenStreetMap: check the signs too."), th.muted)
+                    };
+                    ui.label(text(line, 13.5, ink, Weight::Medium));
+                });
             });
-        }
-        if engine.nav.is_some() {
-            if let Some(nav) = &engine.nav {
-                Self::next_turn(ui, th, nav, engine.arrival_time());
-            }
-            self.map_card(ui, engine, th);
-            if let Some(nav) = &engine.nav {
-                m3::card(ui, th, |ui| {
-                    m3::label(ui, th, t("Coming up"));
-                    for m in nav.route.maneuvers.iter().skip(nav.next).take(5) {
-                        ui.horizontal(|ui| {
-                            let (rect, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
-                            draw_turn(&ui.painter_at(rect), rect, Some(m), false, th.accent);
-                            ui.add_space(6.0);
-                            ui.label(text(m.text.as_str(), 14.5, th.text, Weight::Regular));
-                        });
-                        ui.add_space(4.0);
-                    }
-                });
-            }
-            if m3::button(ui, th, t("Stop navigation"), Some("x"), Kind::Outlined, 48.0) {
-                engine.stop_navigation();
-            }
-            ui.add_space(12.0);
-        } else if engine.search_results.is_empty() {
-            if engine.settings.recents.is_empty() {
-                m3::card(ui, th, |ui| {
-                    m3::headline(ui, th, t("Nowhere yet"));
-                    ui.add_space(2.0);
-                    m3::body(ui, th, t("Search for an address or a place. Places you've been will wait here for a quick start."));
-                });
-            } else {
-                m3::card(ui, th, |ui| {
-                    m3::label(ui, th, t("Recent places"));
-                    for place in engine.settings.recents.iter().take(MAX_RECENTS_SHOWN) {
-                        let (name, detail) = split_place(&place.name);
-                        let detail = place_detail(engine.gps, place.at, detail);
-                        if m3::list_row(ui, th, "history", name, &detail, true) {
-                            chosen = Some(place.clone());
-                        }
-                    }
-                });
-            }
-        }
-        if let Some(place) = chosen {
-            engine.navigate_to(&place);
-        }
-        m3::small(ui, th, t("Planning a route sends your position and destination to free OpenStreetMap services. Routes and places: © OpenStreetMap contributors"));
-    }
-
-    /// The street map with the route on it. It turns with the rider, or shows the whole route, north up.
-    fn map_card(&mut self, ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
-        let Some(nav) = engine.nav.clone() else {
-            return;
-        };
-        if self.map.dark != th.dark {
-            self.map.dark = th.dark;
-            self.map.tiles.clear();
-            engine.forget_tiles();
-        }
-        let ctx = ui.ctx().clone();
-        for _ in 0..TILES_DECODED_PER_FRAME {
-            let Some((key, path)) = engine.tiles_ready.pop() else {
-                break;
-            };
-            if let Some(image) = load_tile(&path, th.dark) {
-                if self.map.tiles.len() >= TILES_KEPT {
-                    self.map.tiles.clear();
-                    engine.forget_tiles();
-                }
-                self.map.tiles.insert(key, ctx.load_texture("map", image, TextureOptions::LINEAR));
-            }
-        }
-        if !engine.tiles_ready.is_empty() {
-            ctx.request_repaint();
-        }
-
-        let frame = Frame::new().fill(th.raised).corner_radius(CornerRadius::same(m3::CARD_RADIUS));
-        frame.show(ui, |ui| {
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), MAP_HEIGHT), Sense::hover());
-            let painter = ui.painter_at(rect);
-            let points = &nav.route.points;
-
-            // Where to look: the whole route, or just ahead of the rider.
-            let (z, centre_at, anchor, turn) = if self.map.whole_route {
-                let (mut lat0, mut lat1, mut lon0, mut lon1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
-                for p in points {
-                    lat0 = lat0.min(p.0);
-                    lat1 = lat1.max(p.0);
-                    lon0 = lon0.min(p.1);
-                    lon1 = lon1.max(p.1);
-                }
-                let mut z = CLOSE_ZOOM;
-                while z > 8 {
-                    let span = map_position((lat0, lon1), z) - map_position((lat1, lon0), z);
-                    if span.x * TILE_POINTS < rect.width() * 0.85 && span.y * TILE_POINTS < rect.height() * 0.85 {
-                        break;
-                    }
-                    z -= 1;
-                }
-                (z, ((lat0 + lat1) / 2.0, (lon0 + lon1) / 2.0), rect.center(), 0.0f32)
-            } else {
-                let z = if engine.speed_kmh.is_some_and(|s| s > FAR_ZOOM_KMH) { FAR_ZOOM } else { CLOSE_ZOOM };
-                let at = engine.gps.unwrap_or(points[nav.index_along()]);
-                let wanted = engine.heading_deg.unwrap_or(0.0) as f32;
-                let gap = (wanted - self.map.heading_deg + 540.0).rem_euclid(360.0) - 180.0;
-                if gap.abs() > 0.5 {
-                    self.map.heading_deg += gap * HEADING_EASE;
-                    ctx.request_repaint();
-                }
-                (z, at, rect.center() + Vec2::new(0.0, rect.height() * 0.24), self.map.heading_deg.to_radians())
-            };
-            let (sin, cos) = (-turn).sin_cos();
-            let centre = map_position(centre_at, z);
-            let to_screen = |p: Vec2| {
-                let d = (p - centre) * TILE_POINTS;
-                anchor + Vec2::new(d.x * cos - d.y * sin, d.x * sin + d.y * cos)
-            };
-
-            // The map pictures that fall inside the card.
-            let reach = (rect.size().length() / TILE_POINTS).ceil() as i32 + 1;
-            let count = 1i64 << z;
-            for dy in -reach..=reach {
-                for dx in -reach..=reach {
-                    let (tx, ty) = (centre.x.floor() as i64 + i64::from(dx), centre.y.floor() as i64 + i64::from(dy));
-                    if tx < 0 || ty < 0 || tx >= count || ty >= count {
-                        continue;
-                    }
-                    let corner = |ox: f32, oy: f32| to_screen(Vec2::new(tx as f32 + ox, ty as f32 + oy));
-                    let quad = [corner(0.0, 0.0), corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0)];
-                    if !Rect::from_points(&quad).intersects(rect) {
-                        continue;
-                    }
-                    let key = (z, tx as u32, ty as u32);
-                    engine.want_tile(key);
-                    if let Some(texture) = self.map.tiles.get(&key) {
-                        let mut mesh = egui::Mesh::with_texture(texture.id());
-                        let uvs = [Pos2::new(0.0, 0.0), Pos2::new(1.0, 0.0), Pos2::new(1.0, 1.0), Pos2::new(0.0, 1.0)];
-                        for (pos, uv) in quad.into_iter().zip(uvs) {
-                            mesh.vertices.push(egui::epaint::Vertex { pos, uv, color: Color32::WHITE });
-                        }
-                        mesh.add_triangle(0, 1, 2);
-                        mesh.add_triangle(0, 2, 3);
-                        painter.add(egui::Shape::mesh(mesh));
-                    }
-                }
-            }
-
-            // The route: what's been ridden fades, and what's ahead stands out.
-            let along = nav.index_along();
-            let line = |part: &[LatLon]| -> Vec<Pos2> { part.iter().map(|p| to_screen(map_position(*p, z))).collect() };
-            painter.line(line(&points[..=along]), Stroke::new(5.0, th.faint));
-            painter.line(line(&points[along..]), Stroke::new(9.0, th.surface));
-            painter.line(line(&points[along..]), Stroke::new(6.0, th.accent));
-            if let Some(m) = nav.current() {
-                let spot = points[m.begin.min(points.len() - 1)];
-                painter.circle(to_screen(map_position(spot, z)), 6.0, th.surface, Stroke::new(3.0, th.accent));
-            }
-            if let Some(last) = points.last() {
-                painter.circle(to_screen(map_position(*last, z)), 8.0, th.warning, Stroke::new(3.0, th.surface));
-            }
-
-            // The rider, as an arrow pointing the way they're going.
-            if let Some(at) = engine.gps {
-                let spot = to_screen(map_position(at, z));
-                let way = if self.map.whole_route { engine.heading_deg.unwrap_or(0.0) as f32 } else { 0.0 };
-                let (s, c) = way.to_radians().sin_cos();
-                let tip = |x: f32, y: f32| spot + Vec2::new(x * c - y * s, x * s + y * c);
-                let arrow = vec![tip(0.0, -15.0), tip(11.0, 11.0), tip(0.0, 5.0), tip(-11.0, 11.0)];
-                painter.circle_filled(spot, 21.0, th.accent.gamma_multiply(0.22));
-                painter.add(egui::Shape::convex_polygon(vec![arrow[0], arrow[1], arrow[2]], th.accent, Stroke::NONE));
-                painter.add(egui::Shape::convex_polygon(vec![arrow[0], arrow[2], arrow[3]], th.accent, Stroke::NONE));
-                painter.add(egui::Shape::closed_line(arrow, Stroke::new(2.0, th.surface)));
-            }
-
-            // The switch between following the rider and seeing the whole route.
-            let button = Rect::from_center_size(rect.right_top() + Vec2::new(-34.0, 34.0), Vec2::splat(48.0));
-            let response = ui.interact(button, ui.scope_id().with("map-view"), Sense::click());
-            painter.circle_filled(button.center(), 22.0, th.surface);
-            let glyph = if self.map.whole_route { "target" } else { "route" };
-            icon(&painter, Rect::from_center_size(button.center(), Vec2::splat(24.0)), glyph, false, th.accent);
-            if response.clicked() {
-                self.map.whole_route = !self.map.whole_route;
-            }
-
-            let credit = rect.right_bottom() + Vec2::new(-8.0, -6.0);
-            let font = FontId::new(10.0, Weight::Medium.family());
-            let galley = painter.layout_no_wrap("© OpenStreetMap".to_string(), font, th.muted);
-            let back = Rect::from_min_size(credit - galley.size() - Vec2::splat(3.0), galley.size() + Vec2::splat(6.0));
-            painter.rect_filled(back, CornerRadius::same(4), th.surface.gamma_multiply(0.85));
-            painter.galley(back.min + Vec2::splat(3.0), galley, th.muted);
         });
-        ui.add_space(10.0);
     }
 
     fn voice_screen(ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
@@ -937,6 +678,8 @@ impl CompanionApp {
                 (t("Battery and range"), &mut s.say_battery),
                 (t("Consumption"), &mut s.say_consumption),
                 (t("Directions"), &mut s.say_navigation),
+                (t("Speed limits on new roads"), &mut s.say_limits),
+                (t("Warn me when I'm over the limit"), &mut s.warn_speeding),
                 (t("Calls"), &mut s.say_calls),
             ];
             for (name, value) in choices {
@@ -1370,6 +1113,24 @@ impl CompanionApp {
                     *confirm_forget = !*confirm_forget;
                 }
             }
+            Link::Waiting | Link::NotFound => {
+                let waiting = engine.link == Link::Waiting;
+                m3::headline(ui, th, if waiting { t("Waiting for the moped") } else { t("Moped not found") });
+                ui.add_space(4.0);
+                m3::body(ui, th, if waiting {
+                    t("Switch the moped on and Pillion connects by itself. It isn't searching meanwhile, to save the phone's battery.")
+                } else {
+                    t("Make sure the moped is on and close by, then look again.")
+                });
+                ui.add_space(12.0);
+                if m3::button(ui, th, t("Look for it now"), Some("bluetooth"), Kind::Filled, 48.0) {
+                    engine.connect();
+                }
+                ui.add_space(6.0);
+                if m3::button(ui, th, t("Try a demo ride"), Some("play"), Kind::Outlined, 46.0) {
+                    engine.start_demo();
+                }
+            }
             Link::Scanning | Link::Connecting | Link::LoggingIn => {
                 let line = match engine.link {
                     Link::Scanning => t("Looking for the moped. Turn it on and stay close."),
@@ -1531,6 +1292,11 @@ impl CompanionApp {
                 engine.save_settings();
             }
             ui.add_space(6.0);
+            let glass = engine.settings.glass;
+            if m3::switch_row(ui, th, t("Glass look"), glass) {
+                engine.settings.glass = !glass;
+                engine.save_settings();
+            }
             let high = engine.settings.high_contrast;
             if m3::switch_row(ui, th, t("High contrast"), high) {
                 engine.settings.high_contrast = !high;
@@ -1691,27 +1457,28 @@ impl eframe::App for CompanionApp {
         for prompt in crate::desktop_prompts(&mut engine) {
             self.ask_typed(prompt.0, prompt.1);
         }
-        let th = theme::tokens(is_dark(&ctx, &engine), engine.settings.high_contrast);
+        let th = theme::with_glass(theme::tokens(is_dark(&ctx, &engine), engine.settings.high_contrast), engine.settings.glass);
+        theme::paint_wash(&ctx.layer_painter(egui::LayerId::background()), ctx.content_rect(), &th);
         ctx.set_visuals(if th.dark { egui::Visuals::dark() } else { egui::Visuals::light() });
 
         let scale = ctx.pixels_per_point();
         let (bar_top, bar_bottom) = engine.system_bars_px;
         Panel::bottom("tabs")
-            .frame(Frame::new().fill(th.sidebar))
+            .frame(Frame::new().fill(theme::frosted(&th, th.sidebar)).stroke(if th.glass { Stroke::new(1.0, th.glass_edge) } else { Stroke::NONE }))
             .show_separator_line(false)
             .show(ui, |ui| {
                 self.nav_bar(ui, &th);
                 ui.add_space(bar_bottom / scale);
             });
         Panel::top("title")
-            .frame(Frame::new().fill(th.bg).inner_margin(Margin::symmetric(14, 4)))
+            .frame(Frame::new().fill(if th.glass { Color32::TRANSPARENT } else { th.bg }).inner_margin(Margin::symmetric(14, 4)))
             .show_separator_line(false)
             .show(ui, |ui| {
                 ui.add_space(bar_top / scale);
                 self.top_bar(ui, &engine, &th);
             });
         CentralPanel::default()
-            .frame(Frame::new().fill(th.bg).inner_margin(Margin::symmetric(14, 4)))
+            .frame(Frame::new().fill(if th.glass { Color32::TRANSPARENT } else { th.bg }).inner_margin(Margin::symmetric(14, 4)))
             .show(ui, |ui| {
                 let area = ui.max_rect().expand2(Vec2::new(14.0, 4.0));
                 let age = ui.input(|i| i.time) - self.changed_screen_at;

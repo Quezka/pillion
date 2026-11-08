@@ -1,17 +1,19 @@
 //! Pillion, a riding companion for an electric moped. See MECHANICS.md for the facts it's built on.
 
-pub mod demo;
-pub mod engine;
-pub mod locale;
-pub mod m3;
-pub mod model3d;
-pub mod nav;
-pub mod protocol;
-pub mod qr;
-mod symbols;
-pub mod theme;
+//! Layers (Clean Architecture): `domain` (rules) ← `application` (the Engine) ← `infra` (web services, adapters) and
+//! `ui` (screens). `android.rs` and `main.rs` wire them together. `tests/architecture.rs` keeps the arrows pointing in.
+pub mod application;
+pub mod domain;
+pub mod infra;
 pub mod ui;
-pub mod update;
+mod wiring;
+
+// The old flat paths, so code written against them keeps working.
+pub use application::{demo, engine, locale, nav};
+pub use domain::protocol;
+pub use infra::{qr, update};
+pub use ui::{m3, model3d, theme};
+pub(crate) use ui::symbols;
 
 #[cfg(target_os = "android")]
 mod android;

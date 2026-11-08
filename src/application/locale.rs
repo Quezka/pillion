@@ -87,6 +87,42 @@ pub fn tf(message: &'static str, values: &[&dyn Display]) -> String {
 
 /// (English, Italian, Russian)
 const MESSAGES: &[(&str, &str, &str)] = &[
+    ("New route.", "Nuovo percorso.", "Новый маршрут."),
+    ("You'll be there at {}.", "Arriverai alle {}.", "Будете на месте в {}."),
+    ("Halfway there, {} kilometres to go.", "A metà strada, mancano {} chilometri.", "Полпути позади, осталось {} км."),
+    // 0.3.0: waiting for the moped, speed limits, saved places, the map, the glass look.
+    ("Clear the results", "Cancella i risultati", "Очистить результаты"),
+    ("From OpenStreetMap: check the signs too.", "Da OpenStreetMap: controlla anche i cartelli.", "Из OpenStreetMap: смотрите и на знаки."),
+    ("Glass look", "Aspetto vetro", "Эффект стекла"),
+    ("Go here", "Vai qui", "Ехать сюда"),
+    ("Home", "Casa", "Дом"),
+    ("Work", "Lavoro", "Работа"),
+    ("Look for it now", "Cercalo adesso", "Искать сейчас"),
+    ("Make sure the moped is on and close by, then look again.", "Controlla che il motorino sia acceso e vicino, poi cerca di nuovo.", "Убедитесь, что мопед включён и рядом, и поищите снова."),
+    ("Moped not found", "Motorino non trovato", "Мопед не найден"),
+    ("Name", "Nome", "Название"),
+    ("Places found", "Luoghi trovati", "Найденные места"),
+    ("Save", "Salva", "Сохранить"),
+    ("Save this place", "Salva questo posto", "Сохранить это место"),
+    ("Saved as Home.", "Salvato come Casa.", "Сохранено как «Дом»."),
+    ("Saved as Work.", "Salvato come Lavoro.", "Сохранено как «Работа»."),
+    ("Saved places", "Luoghi salvati", "Сохранённые места"),
+    ("Saved {}.", "Salvato {}.", "Сохранено: {}."),
+    ("Set {}", "Imposta {}", "Задать: {}"),
+    ("Slow down: the limit here is {}.", "Rallenta: qui il limite è {}.", "Сбавьте скорость: здесь ограничение {}."),
+    ("Speed limit", "Limite di velocità", "Ограничение скорости"),
+    ("Speed limit {}.", "Limite di velocità {}.", "Ограничение скорости {}."),
+    ("{}: speed limit {}.", "{}: limite di velocità {}.", "{}: ограничение скорости {}."),
+    ("Speed limits on new roads", "Limiti di velocità sulle nuove strade", "Ограничения скорости на новых дорогах"),
+    ("Star a place to save it, or press and hold on the map. Tap a filled star to forget it.", "Tocca la stella per salvare un posto, o tieni premuto sulla mappa. Tocca una stella piena per dimenticarlo.", "Нажмите на звёздочку, чтобы сохранить место, или удерживайте палец на карте. Нажмите на закрашенную звёздочку, чтобы удалить."),
+    ("Switch the moped on and Pillion connects by itself. It isn't searching meanwhile, to save the phone's battery.", "Accendi il motorino e Pillion si collega da solo. Nel frattempo non cerca, per risparmiare la batteria del telefono.", "Включите мопед, и Pillion подключится сам. Пока он ничего не ищет, чтобы беречь батарею телефона."),
+    ("Tap to save where you are now", "Tocca per salvare dove sei adesso", "Нажмите, чтобы сохранить, где вы сейчас"),
+    ("The spot on the map", "Il punto sulla mappa", "Точка на карте"),
+    ("The spot you picked", "Il punto che hai scelto", "Выбранная точка"),
+    ("Waiting for the moped", "In attesa del motorino", "Ждём мопед"),
+    ("Warn me when I'm over the limit", "Avvisami quando supero il limite", "Предупреждать о превышении"),
+    ("You're going faster than the limit.", "Stai andando più veloce del limite.", "Вы едете быстрее, чем разрешено."),
+    ("{} from you", "a {} da te", "{} от вас"),
     // What the voice says.
     ("Moped connection lost.", "Connessione con il motorino persa.", "Связь с мопедом потеряна."),
     ("The moped refused the pairing code.", "Il motorino ha rifiutato il codice di abbinamento.", "Мопед не принял код сопряжения."),
@@ -370,11 +406,12 @@ mod tests {
     #[test]
     fn every_string_in_the_code_is_translated() {
         let sources = [
-            include_str!("ui.rs"),
+            include_str!("../ui/mod.rs"),
             include_str!("engine.rs"),
             include_str!("nav.rs"),
             include_str!("demo.rs"),
-            include_str!("m3.rs"),
+            include_str!("../ui/m3.rs"),
+            include_str!("../ui/map.rs"),
         ];
         let mut count = 0;
         for source in sources {

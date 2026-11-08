@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.0] - 2026-11-08
+
+- When the moped is switched off, Pillion stops looking for it. It leaves one low-power request with the phone's
+  Bluetooth, so it reconnects by itself as soon as the moped is on again. The first search gives up after 45 seconds
+  instead of running forever.
+- Much lighter on the phone's battery when not riding: no GPS with the screen off, a slow GPS fix with it on, and
+  Pillion checks for work once a second instead of twenty times.
+- Speed limits: riding onto a road with a different limit, the voice says it ("Via Zamboni: speed limit 30"), and a
+  road sign shows on the Ride and Route screens. It warns once per road when you stay over the limit. The limits come
+  from OpenStreetMap, so check the real signs too; where the map has none, Pillion says nothing. Both can be switched
+  off on the Voice tab.
+- A new map: drag it, pinch or use the buttons to zoom, and the target button brings it back to you. Press and hold
+  a spot to go there or save it. It shows how far the battery reaches, on real roads when online, as a circle
+  otherwise.
+- Saved places: Home, Work and any place you star, on the Route tab and on the map. Search is now typo-tolerant and
+  puts places near you first.
+- Better spoken directions: the route's start says when you'll arrive, longer rides get a "halfway there", and after
+  going off the route you hear "New route".
+- A glass look over Material 3, with brighter colours, like the rest of the suite. Settings turns it off; High
+  contrast stays solid.
+
 ## [0.2.1] - 2026-11-06
 
 - Pillion is now free software under the GNU GPL version 3. The app says so in Settings and carries the licence and the notices for

@@ -166,6 +166,27 @@ final class Ble {
         }
     }
 
+    /**
+     * Leaves one request open for the moped, without scanning. Android hands it to the Bluetooth chip, which connects
+     * by itself when the moped is switched on: almost no battery while waiting. An open request for the same moped is
+     * kept as it is.
+     */
+    void waitFor(String address) {
+        if (gatt != null && gatt.getDevice() != null && address.equals(gatt.getDevice().getAddress())) {
+            return;
+        }
+        BluetoothAdapter adapter = adapter();
+        if (adapter == null) {
+            return;
+        }
+        try {
+            closeGatt();
+            gatt = adapter.getRemoteDevice(address).connectGatt(context, true, callback, BluetoothDevice.TRANSPORT_LE);
+        } catch (SecurityException | IllegalArgumentException cannotConnect) {
+            // Without the permission there's nothing to wait with; "Look for it now" tries again.
+        }
+    }
+
     void disconnect() {
         try {
             closeGatt();

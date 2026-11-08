@@ -10,7 +10,7 @@ use jni::sys::{jint, jstring};
 use jni::JNIEnv;
 use winit::platform::android::activity::AndroidApp;
 
-use crate::engine::{BluetoothState, CallState, Command, Engine, UpdateState, VoicePack};
+use crate::engine::{BluetoothState, CallState, Command, Engine, Power, UpdateState, VoicePack};
 use crate::locale::Lang;
 use crate::protocol::{from_hex, to_hex, ClockTime};
 use crate::ui::CompanionApp;
@@ -28,10 +28,13 @@ fn engine() -> &'static Arc<Mutex<Engine>> {
         std::thread::spawn(move || {
             let start = Instant::now();
             loop {
+                // Quick while riding or looking at the screen, slow at rest: this loop is part of the battery cost.
+                let mut pace = TICK;
                 if let Ok(mut e) = ticking.lock() {
                     e.tick(start.elapsed().as_secs_f64());
+                    pace = Duration::from_millis(e.pace_ms());
                 }
-                std::thread::sleep(TICK);
+                std::thread::sleep(pace);
             }
         });
         engine
@@ -49,6 +52,13 @@ fn encode(command: Command) -> String {
         Command::SetSpeechRate(rate) => vec!["rate".into(), rate.to_string()],
         Command::FetchRoute { url, destination } => vec!["route".into(), url, destination],
         Command::Search { url } => vec!["search".into(), url],
+        Command::Fetch { key, url } => vec!["fetch".into(), key, url],
+        Command::SetPower(power) => vec!["power".into(), match power {
+            Power::Ride => "ride",
+            Power::Look => "look",
+            Power::Rest => "rest",
+        }.into()],
+        Command::WaitFor(address) => vec!["wait_for".into(), address],
         Command::AskText { key, title, hint, dark } => vec!["ask".into(), key, title, hint, u8::from(dark).to_string()],
         Command::Haptic => vec!["haptic".into()],
         Command::ScanQr { title, torch, type_it, cancel } => vec!["scan_qr".into(), title, torch, type_it, cancel],
@@ -116,6 +126,9 @@ fn handle_event(e: &mut Engine, message: &str) {
         ["route_ok", destination, json] => e.on_route_reply(Ok(json), destination),
         ["route_err", destination, error] => e.on_route_reply(Err(error), destination),
         ["search_ok", json] => e.on_search_reply(Ok(json)),
+        ["fetch_ok", key, json] => e.on_fetch(key, Ok(json)),
+        ["fetch_err", key, error] => e.on_fetch(key, Err(error)),
+        ["screen", on] => e.set_screen_on(*on == "1"),
         ["search_err", error] => e.on_search_reply(Err(error)),
         ["text", key, value] => e.on_text(key, value),
         ["button"] => e.speak_status(),

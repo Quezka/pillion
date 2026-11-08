@@ -64,9 +64,15 @@ pub fn label(ui: &mut Ui, th: &Tokens, value: &str) {
 }
 
 fn card_frame(th: &Tokens, fill: Color32) -> Frame {
-    let stroke = if th.outlined { Stroke::new(1.5, th.border) } else { Stroke::NONE };
+    let stroke = if th.outlined {
+        Stroke::new(1.5, th.border)
+    } else if th.glass {
+        Stroke::new(1.0, th.glass_edge)
+    } else {
+        Stroke::NONE
+    };
     Frame::new()
-        .fill(fill)
+        .fill(crate::ui::theme::frosted(th, fill))
         .stroke(stroke)
         .corner_radius(CornerRadius::same(CARD_RADIUS))
         .inner_margin(Margin::same(16))
@@ -90,8 +96,18 @@ pub fn hero(ui: &mut Ui, th: &Tokens, add: impl FnOnce(&mut Ui)) {
     ui.add_space(10.0);
 }
 
+/// A frosted rounded panel painted straight onto the screen (map buttons, the search bar).
+pub fn glass_panel(painter: &eframe::egui::Painter, rect: Rect, radius: u8, th: &Tokens) {
+    let round = CornerRadius::same(radius);
+    painter.rect_filled(rect, round, if th.glass { th.surface.gamma_multiply(0.82) } else { th.raised });
+    let edge = if th.outlined { Stroke::new(1.5, th.border) } else if th.glass { Stroke::new(1.0, th.glass_edge) } else { Stroke::NONE };
+    painter.rect_stroke(rect, round, edge, StrokeKind::Inside);
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Kind {
+    /// No fill and no outline: a quiet action inside a card.
+    Text,
     /// One per screen at most, for the main action.
     Filled,
     Tonal,
@@ -104,7 +120,7 @@ pub fn button(ui: &mut Ui, th: &Tokens, label: &str, glyph: Option<&'static str>
     let (fill, ink) = match kind {
         Kind::Filled => (th.accent, th.on_accent),
         Kind::Tonal => (th.accent_soft, th.on_accent_soft),
-        Kind::Outlined => (Color32::TRANSPARENT, th.accent),
+        Kind::Outlined | Kind::Text => (Color32::TRANSPARENT, th.accent),
         Kind::Danger => (th.danger, if th.dark { th.bg } else { th.surface }),
     };
     let size = Vec2::new(ui.available_width(), height);
@@ -253,8 +269,14 @@ pub fn filter_chip(ui: &mut Ui, th: &Tokens, value: &str, chosen: bool) -> bool 
 /// A square tile with a big value and a label.
 pub fn tile(ui: &mut Ui, th: &Tokens, glyph: &'static str, value: &str, caption: &str) {
     Frame::new()
-        .fill(th.surface)
-        .stroke(if th.outlined { Stroke::new(1.5, th.border) } else { Stroke::NONE })
+        .fill(crate::ui::theme::frosted(th, th.surface))
+        .stroke(if th.outlined {
+            Stroke::new(1.5, th.border)
+        } else if th.glass {
+            Stroke::new(1.0, th.glass_edge)
+        } else {
+            Stroke::NONE
+        })
         .corner_radius(CornerRadius::same(16))
         .inner_margin(Margin::symmetric(14, 12))
         .show(ui, |ui| {

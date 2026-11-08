@@ -3,6 +3,22 @@
 
 use serde_json::Value;
 
+pub use crate::application::ports::Release;
+use crate::application::ports::ReleaseFeed;
+
+/// The ReleaseFeed the app uses: GitHub's releases of the public repository.
+pub struct GitHubReleases;
+
+impl ReleaseFeed for GitHubReleases {
+    fn latest_url(&self) -> String {
+        latest_release_url()
+    }
+
+    fn parse_latest(&self, json: &str, current: &str) -> Result<Option<Release>, String> {
+        parse_latest(json, current)
+    }
+}
+
 /// Where releases are published. It has to be a public repository, as the app asks without logging in.
 const REPOSITORY: &str = match option_env!("PILLION_UPDATE_REPO") {
     Some(repository) => repository,
@@ -12,15 +28,6 @@ const NOTES_LIMIT: usize = 600;
 
 pub fn latest_release_url() -> String {
     format!("https://api.github.com/repos/{REPOSITORY}/releases/latest")
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Release {
-    pub version: String,
-    pub url: String,
-    /// The file's SHA-256 as GitHub reports it, when it does.
-    pub sha256: String,
-    pub notes: String,
 }
 
 /// The parts of a version such as `v1.2.3`, or `None` if it isn't one.

@@ -1,4 +1,4 @@
-"""Writes src/symbols.rs: Google's Material Symbols (Outlined, Apache 2.0), fetched the way suite-kit's
+"""Writes src/ui/symbols.rs: Google's Material Symbols (Outlined, Apache 2.0), fetched the way suite-kit's
 tools/make_symbols.py fetches them, so the icons match the rest of the suite.
 Run from app/ after changing MAP: python3 tools/make_symbols.py"""
 import re
@@ -21,6 +21,9 @@ MAP = {
     "turn-slight-left": "turn_slight_left", "turn-slight-right": "turn_slight_right", "turn-straight": "straight",
     "u-turn-left": "u_turn_left", "u-turn-right": "u_turn_right", "voice": "record_voice_over",
     "volume": "volume_up",
+    # The map and saved places (0.3.0)
+    "star": "star", "home": "home", "work": "work", "plus": "add", "minus": "remove", "pin": "location_on",
+    "speed": "speed", "map": "map", "delete": "delete", "near": "near_me",
 }
 
 
@@ -55,7 +58,7 @@ def main():
     ]
     lines += [f'    ("{n}", "{o}", "{f}"),' for n, o, f in rows]
     lines.append("];")
-    Path("src/symbols.rs").write_text("\n".join(lines) + "\n")
+    Path("src/ui/symbols.rs").write_text("\n".join(lines) + "\n")
     print(len(rows), "symbols")
 
 

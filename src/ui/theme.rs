@@ -28,6 +28,12 @@ pub struct Tokens {
     /// High contrast keeps stark lines around things, where Material 3 has none.
     pub outlined: bool,
     pub dark: bool,
+    /// Liquid glass on top of Material 3: surfaces see-through over a colour wash, with a light edge. Off in high
+    /// contrast. Text colours never change with it.
+    pub glass: bool,
+    pub glass_edge: Color32,
+    /// The second colour of the wash, opposite the accent (the suite's pink).
+    pub glow: Color32,
 }
 
 const fn hex(rgb: u32) -> Color32 {
@@ -35,43 +41,49 @@ const fn hex(rgb: u32) -> Color32 {
 }
 
 pub const LIGHT: Tokens = Tokens {
-    bg: hex(0xf6f5fc),
+    bg: hex(0xf3f2ff),
     surface: hex(0xffffff),
-    raised: hex(0xe9e8f6),
-    sidebar: hex(0xeeedf8),
-    border: hex(0xb9bec9),
-    text: hex(0x0e1116),
-    muted: hex(0x3f4654),
-    faint: hex(0x5d6573),
-    accent: hex(0x4b4bc8),
-    accent_soft: hex(0xdddcfb),
+    raised: hex(0xe9e8ff),
+    sidebar: hex(0xeceaff),
+    border: hex(0xb3b6cc),
+    text: hex(0x0b0d14),
+    muted: hex(0x343b4d),
+    faint: hex(0x4d5466),
+    accent: hex(0x4f46e5),
+    accent_soft: hex(0xdcdbff),
     on_accent: hex(0xffffff),
-    on_accent_soft: hex(0x23236e),
-    danger: hex(0xc4262c),
-    success: hex(0x1f7a4d),
+    on_accent_soft: hex(0x1e1a78),
+    danger: hex(0xd0262d),
+    success: hex(0x127a46),
     warning: hex(0xb45309),
     outlined: false,
     dark: false,
+    glass: true,
+    glass_edge: Color32::from_rgba_premultiplied(235, 235, 235, 235),
+    glow: hex(0xec4899),
 };
 
 pub const DARK: Tokens = Tokens {
-    bg: hex(0x111119),
-    surface: hex(0x1b1b25),
-    raised: hex(0x28283a),
-    sidebar: hex(0x16161f),
-    border: hex(0x4a4e57),
-    text: hex(0xf4f5f7),
-    muted: hex(0xc3c8d2),
-    faint: hex(0x98a0ad),
-    accent: hex(0x9a9bff),
-    accent_soft: hex(0x35366b),
-    on_accent: hex(0x0e0f11),
-    on_accent_soft: hex(0xe2e2ff),
+    bg: hex(0x0e0e19),
+    surface: hex(0x1a1a2b),
+    raised: hex(0x27273f),
+    sidebar: hex(0x13131f),
+    border: hex(0x4b4e66),
+    text: hex(0xf6f7fb),
+    muted: hex(0xcbcfdd),
+    faint: hex(0xa2a8bb),
+    accent: hex(0xa9a6ff),
+    accent_soft: hex(0x3b3984),
+    on_accent: hex(0x0b0b14),
+    on_accent_soft: hex(0xe4e3ff),
     danger: hex(0xff7b80),
-    success: hex(0x4fe39b),
-    warning: hex(0xf5a524),
+    success: hex(0x4ade80),
+    warning: hex(0xfbbf24),
     outlined: false,
     dark: true,
+    glass: true,
+    glass_edge: Color32::from_rgba_premultiplied(40, 40, 40, 40),
+    glow: hex(0xec4899),
 };
 
 pub const HIGH_LIGHT: Tokens = Tokens {
@@ -92,6 +104,9 @@ pub const HIGH_LIGHT: Tokens = Tokens {
     warning: hex(0x7a4100),
     outlined: true,
     dark: false,
+    glass: false,
+    glass_edge: hex(0x000000),
+    glow: hex(0x1f1fa8),
 };
 
 pub const HIGH_DARK: Tokens = Tokens {
@@ -112,6 +127,9 @@ pub const HIGH_DARK: Tokens = Tokens {
     warning: hex(0xffd400),
     outlined: true,
     dark: true,
+    glass: false,
+    glass_edge: hex(0xffffff),
+    glow: hex(0xffd400),
 };
 
 pub fn tokens(dark: bool, high_contrast: bool) -> Tokens {
@@ -121,6 +139,46 @@ pub fn tokens(dark: bool, high_contrast: bool) -> Tokens {
         (false, true) => HIGH_LIGHT,
         (false, false) => LIGHT,
     }
+}
+
+/// The tokens with the glass look switched on or off by the rider (high contrast never has it).
+pub fn with_glass(mut th: Tokens, on: bool) -> Tokens {
+    th.glass = th.glass && on;
+    th
+}
+
+/// `a` moved `amount` (0..1) of the way to `b`.
+pub fn mix(a: Color32, b: Color32, amount: f32) -> Color32 {
+    let m = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * amount).round() as u8;
+    Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
+}
+
+/// A surface colour: see-through with glass, solid without.
+pub fn frosted(th: &Tokens, colour: Color32) -> Color32 {
+    if th.glass {
+        let alpha = if th.dark { 0.68 } else { 0.70 };
+        colour.gamma_multiply(alpha)
+    } else {
+        colour
+    }
+}
+
+/// Paints the colour wash behind everything: the accent from the top left, a warm glow at the bottom right.
+pub fn paint_wash(painter: &Painter, rect: Rect, th: &Tokens) {
+    painter.rect_filled(rect, 0.0, th.bg);
+    if !th.glass {
+        return;
+    }
+    let a = mix(th.bg, th.accent, if th.dark { 0.22 } else { 0.18 });
+    let b = mix(th.bg, th.glow, if th.dark { 0.14 } else { 0.11 });
+    let mut mesh = egui::Mesh::default();
+    let corners = [(rect.left_top(), a), (rect.right_top(), th.bg), (rect.right_bottom(), b), (rect.left_bottom(), th.bg)];
+    for (pos, colour) in corners {
+        mesh.colored_vertex(pos, colour);
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 #[derive(Clone, Copy)]
@@ -147,10 +205,10 @@ pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     let fallback = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     let faces: [(&str, &'static [u8], Weight); 4] = [
-        ("manrope-regular", include_bytes!("../assets/Manrope-Regular.ttf"), Weight::Regular),
-        ("manrope-medium", include_bytes!("../assets/Manrope-Medium.ttf"), Weight::Medium),
-        ("manrope-semibold", include_bytes!("../assets/Manrope-SemiBold.ttf"), Weight::SemiBold),
-        ("manrope-bold", include_bytes!("../assets/Manrope-Bold.ttf"), Weight::Bold),
+        ("manrope-regular", include_bytes!("../../assets/Manrope-Regular.ttf"), Weight::Regular),
+        ("manrope-medium", include_bytes!("../../assets/Manrope-Medium.ttf"), Weight::Medium),
+        ("manrope-semibold", include_bytes!("../../assets/Manrope-SemiBold.ttf"), Weight::SemiBold),
+        ("manrope-bold", include_bytes!("../../assets/Manrope-Bold.ttf"), Weight::Bold),
     ];
     for (name, bytes, weight) in faces {
         fonts.font_data.insert(name.to_string(), Arc::new(FontData::from_static(bytes)));
@@ -220,8 +278,10 @@ mod tests {
 
     #[test]
     fn colours_are_the_kits() {
-        assert_eq!(LIGHT.accent, Color32::from_rgb(0x4b, 0x4b, 0xc8));
-        assert_eq!(DARK.bg, Color32::from_rgb(0x11, 0x11, 0x19));
+        // suite-kit 0.8 (brighter, with glass).
+        assert_eq!(LIGHT.accent, Color32::from_rgb(0x4f, 0x46, 0xe5));
+        assert!(LIGHT.glass && !tokens(false, true).glass);
+        assert_eq!(DARK.bg, Color32::from_rgb(0x0e, 0x0e, 0x19));
         assert!(tokens(true, true).outlined);
         assert!(!tokens(false, false).dark);
     }

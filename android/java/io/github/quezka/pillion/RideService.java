@@ -52,6 +52,12 @@ public class RideService extends Service {
     private static final String ACTION_STOP = "io.github.quezka.pillion.STOP";
     private static final int NOTIFICATION_ID = 1;
     private static final long POLL_MS = 50;
+    /** At rest (screen off, not riding) the engine is asked for work only this often. */
+    private static final long REST_POLL_MS = 1000;
+    private static final long REST_CLOCK_MS = 30_000;
+    /** With the screen open but not riding, a slow GPS fix is enough for the map. */
+    private static final long LOOK_GPS_MS = 4000;
+    private static final float LOOK_GPS_METRES = 10f;
     private static final long SECOND_MS = 1000;
     private static final long GPS_INTERVAL_MS = 1000;
     private static final float GPS_MIN_METRES = 1f;
@@ -67,6 +73,10 @@ public class RideService extends Service {
     private Voice voice;
     private MediaSession media;
     private LocationManager location;
+    /** "ride", "look" or "rest": how much the phone does for Pillion, as the engine asks. */
+    private String power = "";
+    private long pollMs = POLL_MS;
+    private long clockMs = SECOND_MS;
     private boolean started;
 
     private final Runnable pump = new Runnable() {
@@ -76,7 +86,7 @@ public class RideService extends Service {
             while ((command = Native.poll()) != null) {
                 carryOut(command);
             }
-            main.postDelayed(this, POLL_MS);
+            main.postDelayed(this, pollMs);
         }
     };
 
@@ -84,7 +94,7 @@ public class RideService extends Service {
         @Override
         public void run() {
             sendClockAndBattery();
-            main.postDelayed(this, SECOND_MS);
+            main.postDelayed(this, clockMs);
         }
     };
 
@@ -138,7 +148,7 @@ public class RideService extends Service {
         ble = new Ble(this);
         voice = new Voice(this);
         Native.event("dir", getFilesDir().getAbsolutePath());
-        startGps();
+        setPower("look");
         registerReceiver(phoneState, new IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED));
         startEarpieceButton();
         main.post(pump);
@@ -179,13 +189,31 @@ public class RideService extends Service {
         }
     }
 
-    private void startGps() {
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+    /**
+     * GPS and polling to match what Pillion is doing. Riding: GPS every second. Screen open: a fix every few seconds for
+     * the map. At rest: no GPS at all and slow polling, which is where most of the battery goes otherwise.
+     */
+    private void setPower(String mode) {
+        if (mode.equals(power)) {
+            return;
+        }
+        power = mode;
+        boolean rest = "rest".equals(mode);
+        pollMs = rest ? REST_POLL_MS : POLL_MS;
+        clockMs = rest ? REST_CLOCK_MS : SECOND_MS;
+        main.removeCallbacks(everySecond);
+        main.postDelayed(everySecond, clockMs);
+        if (location != null) {
+            location.removeUpdates(gps);
+        }
+        if (rest || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             return;
         }
         location = getSystemService(LocationManager.class);
         if (location != null && location.getAllProviders().contains(LocationManager.GPS_PROVIDER)) {
-            location.requestLocationUpdates(LocationManager.GPS_PROVIDER, GPS_INTERVAL_MS, GPS_MIN_METRES, gps, Looper.getMainLooper());
+            boolean ride = "ride".equals(mode);
+            location.requestLocationUpdates(LocationManager.GPS_PROVIDER, ride ? GPS_INTERVAL_MS : LOOK_GPS_MS,
+                    ride ? GPS_MIN_METRES : LOOK_GPS_METRES, gps, Looper.getMainLooper());
         }
     }
 
@@ -314,6 +342,15 @@ public class RideService extends Service {
                 break;
             case "search":
                 fetch(f[1], "search_ok", "search_err", null);
+                break;
+            case "fetch":
+                fetch(f[2], "fetch_ok", "fetch_err", f[1]);
+                break;
+            case "power":
+                setPower(f[1]);
+                break;
+            case "wait_for":
+                ble.waitFor(f[1]);
                 break;
             case "ask":
                 MainActivity.askText(f[1], f[2], f[3], "1".equals(f[4]));

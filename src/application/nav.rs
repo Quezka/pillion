@@ -1,10 +1,10 @@
-//! Routes from the free OpenStreetMap services, and following them by GPS.
+//! A route and following it by GPS: where the rider is along it, what to say and when. Getting the route is the
+//! `MapServices` port's job (`infra::osm`).
 
-use serde_json::Value;
-
-use crate::locale::{self, tf};
-
-const EARTH_RADIUS_M: f64 = 6_371_000.0;
+use crate::domain::geo::EARTH_RADIUS_M;
+pub use crate::domain::geo::{bearing_deg, distance_m, LatLon};
+pub use crate::domain::places::Place;
+use crate::locale::tf;
 pub const TOP_SPEED_KMH: u32 = 45;
 pub const EARLY_ANNOUNCE_M: f64 = 300.0;
 pub const FINAL_ANNOUNCE_M: f64 = 60.0;
@@ -15,13 +15,9 @@ const EARLY_LIMITS_M: (f64, f64) = (150.0, 350.0);
 const FINAL_LIMITS_M: (f64, f64) = (30.0, 70.0);
 /// After a turn, a long way to the next one is worth saying, so the rider knows all is well.
 const LONG_STRETCH_M: f64 = 1500.0;
-/// How far around the rider the place search looks first, in degrees.
-const SEARCH_NEAR_DEG: (f64, f64) = (0.3, 0.2);
-const HEADING_TOLERANCE_DEG: u32 = 60;
 pub const OFF_ROUTE_M: f64 = 50.0;
 pub const OFF_ROUTE_FIXES: u32 = 5;
 const REROUTE_RETRY_FIXES: u32 = 30;
-const NEARBY_RADIUS_M: u32 = 300;
 /// What the routing service says when it can't reach a point with this kind of vehicle.
 pub const NO_PATH_ERROR: &str = "No path could be found";
 const ARRIVED_M: f64 = 25.0;
@@ -29,7 +25,6 @@ const ARRIVED_M: f64 = 25.0;
 /// confusing the progress.
 const SEARCH_AHEAD_M: f64 = 600.0;
 
-pub type LatLon = (f64, f64);
 
 #[derive(Clone, Debug, Default)]
 pub struct Maneuver {
@@ -80,148 +75,6 @@ pub struct Route {
     pub maneuvers: Vec<Maneuver>,
     pub total_m: f64,
     pub total_s: f64,
-}
-
-pub fn distance_m(a: LatLon, b: LatLon) -> f64 {
-    let mean_lat = ((a.0 + b.0) / 2.0).to_radians();
-    let dx = (b.1 - a.1).to_radians() * mean_lat.cos();
-    let dy = (b.0 - a.0).to_radians();
-    (dx * dx + dy * dy).sqrt() * EARTH_RADIUS_M
-}
-
-/// The direction from one point to another, in degrees clockwise from north.
-pub fn bearing_deg(a: LatLon, b: LatLon) -> f64 {
-    let mean_lat = ((a.0 + b.0) / 2.0).to_radians();
-    let dx = (b.1 - a.1).to_radians() * mean_lat.cos();
-    let dy = (b.0 - a.0).to_radians();
-    dx.atan2(dy).to_degrees().rem_euclid(360.0)
-}
-
-/// Valhalla's shape: Google polyline encoding with six decimals.
-pub fn decode_polyline6(shape: &str) -> Vec<LatLon> {
-    let mut points = Vec::new();
-    let (mut lat, mut lon) = (0i64, 0i64);
-    let mut bytes = shape.bytes();
-    let mut next = || -> Option<i64> {
-        let (mut result, mut shift) = (0i64, 0u32);
-        loop {
-            let b = i64::from(bytes.next()?) - 63;
-            result |= (b & 0x1F) << shift;
-            shift += 5;
-            if b < 0x20 || shift > 60 {
-                break;
-            }
-        }
-        Some(if result & 1 == 1 { !(result >> 1) } else { result >> 1 })
-    };
-    while let (Some(dlat), Some(dlon)) = (next(), next()) {
-        lat += dlat;
-        lon += dlon;
-        points.push((lat as f64 / 1e6, lon as f64 / 1e6));
-    }
-    points
-}
-
-fn text_field(m: &Value, keys: &[&str]) -> String {
-    keys.iter()
-        .find_map(|k| m[*k].as_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// `nearby` also accepts roads around the destination, for places a moped can't drive right up to. `heading` is the way the
-/// rider is already going, so that a new route doesn't begin with a U-turn.
-pub fn route_request_url(from: LatLon, to: LatLon, nearby: bool, heading: Option<f64>) -> String {
-    let way = heading.map_or(String::new(), |h| format!(r#","heading":{h:.0},"heading_tolerance":{HEADING_TOLERANCE_DEG}"#));
-    let radius = if nearby { format!(r#","radius":{NEARBY_RADIUS_M}"#) } else { String::new() };
-    let body = format!(
-        concat!(
-            r#"{{"locations":[{{"lat":{},"lon":{}{}}},{{"lat":{},"lon":{}{}}}],"#,
-            r#""costing":"motor_scooter","costing_options":{{"motor_scooter":{{"top_speed":{}}}}},"#,
-            r#""directions_options":{{"units":"kilometers","language":"{}"}}}}"#
-        ),
-        from.0, from.1, way, to.0, to.1, radius, TOP_SPEED_KMH, locale::current().route_code()
-    );
-    format!("https://valhalla1.openstreetmap.de/route?json={}", percent_encode(&body))
-}
-
-/// `near` is where the rider is, so that places close by come first when a name exists in many towns.
-pub fn search_request_url(query: &str, near: Option<LatLon>) -> String {
-    let around = near.map_or(String::new(), |p| {
-        let (dx, dy) = SEARCH_NEAR_DEG;
-        format!("&viewbox={:.3},{:.3},{:.3},{:.3}", p.1 - dx, p.0 + dy, p.1 + dx, p.0 - dy)
-    });
-    format!(
-        "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=6&accept-language={}{}&q={}",
-        locale::current().code(),
-        around,
-        percent_encode(query)
-    )
-}
-
-fn percent_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
-
-#[derive(Clone, Debug)]
-pub struct Place {
-    pub name: String,
-    pub at: LatLon,
-}
-
-pub fn parse_search(json: &str) -> Result<Vec<Place>, String> {
-    let v: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
-    let list = v.as_array().ok_or("unexpected search reply")?;
-    Ok(list
-        .iter()
-        .filter_map(|p| {
-            let lat = p["lat"].as_str()?.parse().ok()?;
-            let lon = p["lon"].as_str()?.parse().ok()?;
-            Some(Place { name: p["display_name"].as_str()?.to_string(), at: (lat, lon) })
-        })
-        .collect())
-}
-
-pub fn parse_route(json: &str, destination: &str) -> Result<Route, String> {
-    let v: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
-    if let Some(message) = v["error"].as_str() {
-        return Err(message.to_string());
-    }
-    let leg = &v["trip"]["legs"][0];
-    let shape = leg["shape"].as_str().ok_or("the route has no shape")?;
-    let points = decode_polyline6(shape);
-    if points.len() < 2 {
-        return Err("the route is too short".to_string());
-    }
-    let list = leg["maneuvers"].as_array().ok_or("the route has no directions")?;
-    let maneuvers: Vec<Maneuver> = list
-        .iter()
-        .map(|m| {
-            let joined_to_next = m["verbal_multi_cue"].as_bool().unwrap_or(false);
-            // When two turns come together, the short form would leave out the second one.
-            let at_keys: &[&str] = if joined_to_next {
-                &["verbal_pre_transition_instruction", "instruction"]
-            } else {
-                &["verbal_succinct_transition_instruction", "verbal_pre_transition_instruction", "instruction"]
-            };
-            Maneuver {
-                kind: m["type"].as_u64().unwrap_or(0) as u32,
-                text: text_field(m, &["instruction"]),
-                spoken_before: text_field(m, &["verbal_pre_transition_instruction", "instruction"]),
-                spoken_at: text_field(m, at_keys),
-                spoken_after: text_field(m, &["verbal_post_transition_instruction"]),
-                joined_to_next,
-                exit: m["roundabout_exit_count"].as_u64().unwrap_or(0) as u32,
-                begin: m["begin_shape_index"].as_u64().unwrap_or(0) as usize,
-            }
-        })
-        .collect();
-    Ok(Route::new(destination, points, maneuvers, v["trip"]["summary"]["time"].as_f64().unwrap_or(0.0)))
 }
 
 impl Route {
@@ -326,6 +179,11 @@ impl Navigation {
         (self.maneuver_along(self.next) - self.along_m).max(0.0)
     }
 
+    /// The index of the route point the rider has just passed.
+    pub fn point_index(&self) -> usize {
+        self.route.along_m.partition_point(|&a| a <= self.along_m).saturating_sub(1)
+    }
+
     pub fn remaining_m(&self) -> f64 {
         (self.route.total_m - self.along_m).max(0.0)
     }
@@ -422,6 +280,15 @@ impl Navigation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infra::osm::decode_polyline6;
+    use crate::application::ports::MapServices as _;
+    use crate::infra::osm::Osm;
+    fn parse_route(json: &str, d: &str) -> Result<Route, String> { Osm.parse_route(json, d) }
+    fn parse_search(json: &str) -> Result<Vec<Place>, String> { Osm.parse_search(json) }
+    fn route_request_url(from: LatLon, to: LatLon, nearby: bool, heading: Option<f64>) -> String {
+        Osm.route_url(from, to, nearby, heading, "en")
+    }
+    fn search_request_url(query: &str, near: Option<LatLon>) -> String { Osm.search_url(query, near, "en") }
 
     fn step(kind: u32, begin: usize, name: &str) -> Maneuver {
         Maneuver {
@@ -646,7 +513,7 @@ mod tests {
         let url = route_request_url((48.1, 2.2), (48.3, 2.4), false, Some(90.0));
         assert!(url.contains("heading%22%3A90"));
         assert!(url.contains("heading_tolerance"));
-        assert!(search_request_url("cafe", Some((48.0, 2.0))).contains("viewbox=1.700,48.200,2.300,47.800"));
+        assert!(search_request_url("cafe", Some((48.0, 2.0))).contains("lat=48.00000&lon=2.00000"));
         assert!((bearing_deg((48.0, 2.0), (48.0, 2.1)) - 90.0).abs() < 0.5);
         assert!(bearing_deg((48.0, 2.0), (47.9, 2.0)) > 179.0);
     }

@@ -64,6 +64,18 @@ public class MainActivity extends NativeActivity {
      * and then Pillion comes straight back: it reconnects to the moped by itself.
      */
     @Override
+    protected void onResume() {
+        super.onResume();
+        Native.event("screen", "1");
+    }
+
+    @Override
+    protected void onPause() {
+        Native.event("screen", "0");
+        super.onPause();
+    }
+
+    @Override
     protected void onDestroy() {
         if (!isFinishing()) {
             startActivity(new Intent(this, Reopen.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));

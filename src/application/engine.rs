@@ -7,8 +7,11 @@ use std::path::PathBuf;
 
 use crate::demo::DemoRide;
 use crate::locale::{self, t, tf, Lang};
-use crate::update::{self, Release};
 use crate::nav::{self, LatLon, NavEvent, Navigation, Place};
+use super::ports::{MapServices, Release, ReleaseFeed};
+use crate::domain::geo;
+use crate::domain::places::{remember_recent, BookmarkKind, Bookmarks};
+use crate::domain::speed_limit::{LimitEvent, LimitWatcher, Road};
 use crate::protocol::{self as proto, ClockTime, DashFlags, Frame, Live, BatteryRecord, Vehicle};
 
 const BATTERY_RECORDS_KEPT: usize = 4;
@@ -22,6 +25,16 @@ const HEADING_MIN_MOVE_M: f64 = 8.0;
 pub type TileKey = (u8, u32, u32);
 
 const CONNECT_TIMEOUT_S: f64 = 15.0;
+/// The first time, Pillion looks for the moped this long before giving up until asked again.
+const SCAN_GIVE_UP_S: f64 = 45.0;
+/// Asking the map for the road under the rider: at most this often, and only after moving this far.
+const ROAD_EVERY_S: f64 = 5.0;
+const ROAD_EVERY_M: f64 = 60.0;
+/// The area the battery reaches is asked again after the rider or the range moves this much.
+const REACH_AGAIN_KM: f64 = 3.0;
+const REACH_EVERY_S: f64 = 120.0;
+/// Routes longer than this get a "halfway there".
+const HALFWAY_FROM_M: f64 = 4000.0;
 const CLOCK_PERIOD_S: f64 = 1.0;
 const FLAGS_DELAY_S: f64 = 0.1;
 const DATA_STALE_S: f64 = 10.0;
@@ -58,6 +71,11 @@ pub enum Command {
     SetSpeechRate(f32),
     FetchRoute { url: String, destination: String },
     Search { url: String },
+    /// Any other web request: the answer comes back to `on_fetch` with the same key.
+    Fetch { key: String, url: String },
+    SetPower(Power),
+    /// Keep a low-power request open for the moped at this address, without scanning.
+    WaitFor(String),
     AskText { key: String, title: String, hint: String, dark: bool },
     ScanQr { title: String, torch: String, type_it: String, cancel: String },
     CheckUpdate { url: String },
@@ -84,6 +102,33 @@ pub enum Link {
     LoggingIn,
     Online,
     Refused,
+    /// The moped is off (or out of reach): nothing is searched. Android keeps one low-power request open with the
+    /// Bluetooth chip, so the link comes back by itself when the moped is switched on.
+    Waiting,
+    /// The first search found nothing: stopped until the rider asks again.
+    NotFound,
+}
+
+/// How much the phone should do for Pillion right now. The Java side turns this into GPS settings and how often it
+/// polls the Engine, which is most of Pillion's battery use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Power {
+    /// Riding or navigating: GPS every second, quick polling.
+    Ride,
+    /// The screen is open but nothing's moving: a slow GPS fix for the map, quick polling for taps.
+    Look,
+    /// Screen off and not riding: no GPS, slow polling.
+    Rest,
+}
+
+impl Power {
+    /// How often the engine ticks and the phone polls it, in milliseconds.
+    pub fn pace_ms(self) -> u64 {
+        match self {
+            Power::Ride | Power::Look => 50,
+            Power::Rest => 1000,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,6 +229,13 @@ pub struct Settings {
     /// `None` follows the phone.
     pub language: Option<Lang>,
     pub recents: Vec<Place>,
+    pub bookmarks: Bookmarks,
+    /// Say the speed limit when riding onto a road with a different one.
+    pub say_limits: bool,
+    /// Say so when riding over the limit for a while.
+    pub warn_speeding: bool,
+    /// The glass look (see-through surfaces over a soft wash of colour).
+    pub glass: bool,
 }
 
 impl Default for Settings {
@@ -212,6 +264,10 @@ impl Default for Settings {
             high_contrast: false,
             language: None,
             recents: Vec::new(),
+            bookmarks: Bookmarks::default(),
+            say_limits: true,
+            warn_speeding: true,
+            glass: true,
         }
     }
 }
@@ -260,7 +316,12 @@ impl Settings {
             self.language.map_or("system", Lang::code),
             self.recents
                 .iter()
-                .map(|p| format!("recent={};{};{}\n", p.at.0, p.at.1, p.name.replace('\n', " ")))
+                .map(|p| format!("recent={};{};{}\n", p.at.0, p.at.1, p.full_name().replace('\n', " ")))
+                .chain(self.bookmarks.items.iter().map(|b| format!(
+                    "bookmark={};{};{};{}\n",
+                    b.kind.code(), b.place.at.0, b.place.at.1, b.place.full_name().replace('\n', " ")
+                )))
+                .chain([format!("limits={}\nspeeding={}\nglass={}\n", flag(self.say_limits), flag(self.warn_speeding), flag(self.glass))])
                 .collect::<String>(),
         )
     }
@@ -321,9 +382,21 @@ impl Settings {
                     let lat = parts.next().and_then(|v| v.parse().ok());
                     let lon = parts.next().and_then(|v| v.parse().ok());
                     if let (Some(lat), Some(lon), Some(name)) = (lat, lon, parts.next()) {
-                        s.recents.push(Place { name: name.to_string(), at: (lat, lon) });
+                        s.recents.push(Place::new(name, (lat, lon)));
                     }
                 }
+                "bookmark" => {
+                    let mut parts = value.splitn(4, ';');
+                    let kind = BookmarkKind::from_code(parts.next().unwrap_or_default());
+                    let lat = parts.next().and_then(|v| v.parse().ok());
+                    let lon = parts.next().and_then(|v| v.parse().ok());
+                    if let (Some(lat), Some(lon), Some(name)) = (lat, lon, parts.next()) {
+                        s.bookmarks.save(kind, Place::new(name, (lat, lon)));
+                    }
+                }
+                "limits" => s.say_limits = on,
+                "speeding" => s.warn_speeding = on,
+                "glass" => s.glass = on,
                 _ => {}
             }
         }
@@ -385,6 +458,23 @@ pub struct Engine {
     update_quietly: bool,
     update_tried_at: Option<f64>,
     pub update: Option<Release>,
+    map: Box<dyn MapServices>,
+    releases: Box<dyn ReleaseFeed>,
+    /// Speed limits of the roads under the rider.
+    pub limits: LimitWatcher,
+    road_asked: Option<(LatLon, f64)>,
+    road_pending: bool,
+    /// The road at each point of the route being followed, when the map gave them.
+    route_roads: Vec<Option<Road>>,
+    /// The area the battery reaches on roads, as outlines, and where and for how far it was asked.
+    pub reach: Vec<Vec<LatLon>>,
+    reach_for: Option<(LatLon, f64, f64)>,
+    reach_pending: bool,
+    /// Whether the screen is on and Pillion is showing; the background service runs without it.
+    pub screen_on: bool,
+    power: Option<Power>,
+    pending_bookmark: Option<LatLon>,
+    halfway_said: bool,
     pub vehicle: Option<Vehicle>,
     pub battery_records: Vec<BatteryRecord>,
     pub recording: bool,
@@ -451,15 +541,23 @@ fn clip(text: &str, limit: usize) -> String {
     }
 }
 
-impl Default for Engine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Engine {
-    pub fn new() -> Self {
+    /// An engine using these services; `crate::wiring` gives the app the real ones.
+    pub fn with(map: Box<dyn MapServices>, releases: Box<dyn ReleaseFeed>) -> Self {
         Self {
+            map,
+            releases,
+            limits: LimitWatcher::default(),
+            road_asked: None,
+            road_pending: false,
+            route_roads: Vec::new(),
+            reach: Vec::new(),
+            reach_for: None,
+            reach_pending: false,
+            screen_on: true,
+            power: None,
+            pending_bookmark: None,
+            halfway_said: false,
             settings: Settings::default(),
             settings_path: None,
             link: Link::NeedsPairing,
@@ -726,13 +824,26 @@ impl Engine {
         match self.link {
             Link::Online | Link::LoggingIn => {
                 let was_online = self.link == Link::Online;
-                self.set_link(Link::Connecting);
-                if was_online {
+                // Usually the moped was switched off. Don't hunt for it: wait quietly until it's back.
+                self.wait_for_moped();
+                if was_online && self.switched_on_said != Some(false) {
                     self.say(t("Moped connection lost."), true);
                 }
             }
             _ => {}
         }
+    }
+
+    /// Stop searching and leave one low-power request open with Android, which reconnects by itself.
+    fn wait_for_moped(&mut self) {
+        if self.settings.address.is_empty() {
+            self.push(Command::StopScan);
+            self.set_link(Link::NotFound);
+        } else {
+            self.set_link(Link::Waiting);
+            self.push(Command::WaitFor(self.settings.address.clone()));
+        }
+        self.limits.reset();
     }
 
     pub fn on_rx(&mut self, bytes: &[u8]) {
@@ -820,7 +931,7 @@ impl Engine {
 
     pub fn check_for_update(&mut self) {
         self.update_state = UpdateState::Checking;
-        self.push(Command::CheckUpdate { url: update::latest_release_url() });
+        self.push(Command::CheckUpdate { url: self.releases.latest_url() });
     }
 
     /// The rider asked, so they want to know how it went.
@@ -840,7 +951,7 @@ impl Engine {
             self.settings.update_checked_on = clock_day(time);
             self.save_settings();
         }
-        match reply.map_err(str::to_string).and_then(|json| update::parse_latest(json, env!("CARGO_PKG_VERSION"))) {
+        match reply.map_err(str::to_string).and_then(|json| self.releases.parse_latest(json, env!("CARGO_PKG_VERSION"))) {
             Ok(Some(release)) => {
                 self.update = Some(release);
                 self.update_state = UpdateState::Available;
@@ -1172,7 +1283,13 @@ impl Engine {
         match key {
             "search" if !value.trim().is_empty() => {
                 self.nav_status = t("Searching...").to_string();
-                self.push(Command::Search { url: nav::search_request_url(value.trim(), self.gps) });
+                let url = self.map.search_url(value.trim(), self.gps, locale::current().code());
+                self.push(Command::Search { url });
+            }
+            "bookmark" if !value.trim().is_empty() => {
+                if let Some(at) = self.pending_bookmark.take() {
+                    self.save_bookmark(BookmarkKind::Other, &Place::new(value.trim(), at));
+                }
             }
             "pair" if !self.set_pairing_code(value) => {
                 self.text_prompt = Some((
@@ -1185,7 +1302,7 @@ impl Engine {
     }
 
     pub fn on_search_reply(&mut self, reply: Result<&str, &str>) {
-        match reply.map_err(str::to_string).and_then(nav::parse_search) {
+        match reply.map_err(str::to_string).and_then(|json| self.map.parse_search(json)) {
             Ok(places) => {
                 self.nav_status = if places.is_empty() { t("Nothing found.").to_string() } else { String::new() };
                 self.search_results = places;
@@ -1196,11 +1313,10 @@ impl Engine {
 
     pub fn navigate_to(&mut self, place: &Place) {
         self.search_results.clear();
-        self.settings.recents.retain(|p| p.name != place.name);
-        self.settings.recents.insert(0, place.clone());
-        self.settings.recents.truncate(RECENT_PLACES);
+        remember_recent(&mut self.settings.recents, place, RECENT_PLACES);
         self.save_settings();
         self.destination = Some((place.name.clone(), place.at));
+        self.route_roads.clear();
         self.range_warned = false;
         self.rerouting = false;
         self.route_nearby = false;
@@ -1221,7 +1337,7 @@ impl Engine {
         let moving = self.speed_kmh.is_some_and(|s| s > MOVING_KMH);
         let heading = self.heading_deg.filter(|_| moving);
         self.push(Command::FetchRoute {
-            url: nav::route_request_url(from, at, self.route_nearby, heading),
+            url: self.map.route_url(from, at, self.route_nearby, heading, locale::current().code()),
             destination: name,
         });
     }
@@ -1232,22 +1348,37 @@ impl Engine {
             return;
         }
         let rerouting = std::mem::replace(&mut self.rerouting, false);
-        match reply.map_err(str::to_string).and_then(|json| nav::parse_route(json, destination)) {
+        match reply.map_err(str::to_string).and_then(|json| self.map.parse_route(json, destination)) {
             Ok(route) => {
                 let nav = Navigation::new(route);
                 let nearby = t("A moped can't get right to that spot, so this goes to the nearest road.");
                 self.nav_status = if self.route_nearby { nearby.to_string() } else { String::new() };
                 if self.settings.say_navigation {
-                    let text = if rerouting {
-                        nav.route.maneuvers.first().map_or(String::new(), |m| m.spoken_before.clone())
+                    let mut text = if rerouting {
+                        let first = nav.route.maneuvers.first().map_or(String::new(), |m| m.spoken_before.clone());
+                        format!("{} {first}", t("New route."))
                     } else if self.route_nearby {
                         format!("{nearby} {}", nav.opening())
                     } else {
                         nav.opening()
                     };
-                    self.say(text, true);
+                    // When the rider will get there, from the phone's clock: more useful than minutes on a moped.
+                    if let (false, Some(clock)) = (rerouting, self.clock) {
+                        let minutes = u32::from(clock.hour) * 60 + u32::from(clock.minute) + (nav.remaining_s() / 60.0).ceil() as u32;
+                        let at = format!("{:02}:{:02}", (minutes / 60) % 24, minutes % 60);
+                        text = format!("{text} {}", tf("You'll be there at {}.", &[&at]));
+                    }
+                    self.say(text.trim().to_string(), true);
+                }
+                let url = self.map.route_roads_url(&nav.route);
+                self.route_roads.clear();
+                if !rerouting {
+                    self.halfway_said = false;
                 }
                 self.nav = Some(nav);
+                if self.settings.say_limits || self.settings.warn_speeding {
+                    self.push(Command::Fetch { key: "route_roads".to_string(), url });
+                }
                 self.check_range_for_route();
             }
             Err(message) if message.contains(nav::NO_PATH_ERROR) && !self.route_nearby => {
@@ -1267,6 +1398,7 @@ impl Engine {
 
     pub fn stop_navigation(&mut self) {
         self.nav = None;
+        self.route_roads.clear();
         self.destination = None;
         self.route_pending = false;
         self.nav_status.clear();
@@ -1310,10 +1442,19 @@ impl Engine {
         if self.route_pending {
             self.request_route();
         }
+        self.follow_limits(at);
         let Some(nav) = self.nav.as_mut() else {
             return;
         };
         let events = nav.update(at, speed_mps);
+        // Halfway on a longer ride: how far is left, so the rider knows all is well.
+        let (total, left) = (nav.route.total_m, nav.remaining_m());
+        if total > HALFWAY_FROM_M && left < total / 2.0 && !self.halfway_said {
+            self.halfway_said = true;
+            if self.settings.say_navigation {
+                self.say(tf("Halfway there, {} kilometres to go.", &[&format!("{:.0}", left / 1000.0)]), false);
+            }
+        }
         for event in events {
             match event {
                 NavEvent::Say { text } => {
@@ -1337,6 +1478,175 @@ impl Engine {
                 }
             }
         }
+    }
+
+    // ----- Power -----
+
+    /// What Pillion needs from the phone right now. See `Power`.
+    pub fn wanted_power(&self) -> Power {
+        let linking = matches!(self.link, Link::Online | Link::LoggingIn | Link::Connecting | Link::Scanning);
+        let riding = self.link == Link::Online && self.switched_on_said != Some(false);
+        if self.demo_active || self.nav.is_some() || self.destination.is_some() || riding {
+            Power::Ride
+        } else if self.screen_on || linking {
+            Power::Look
+        } else {
+            Power::Rest
+        }
+    }
+
+    fn update_power(&mut self) {
+        let wanted = self.wanted_power();
+        if self.power != Some(wanted) {
+            self.power = Some(wanted);
+            self.push(Command::SetPower(wanted));
+        }
+    }
+
+    /// How often the engine should tick, in milliseconds.
+    pub fn pace_ms(&self) -> u64 {
+        self.power.unwrap_or(Power::Look).pace_ms()
+    }
+
+    pub fn set_screen_on(&mut self, on: bool) {
+        self.screen_on = on;
+        self.update_power();
+    }
+
+    // ----- Speed limits -----
+
+    fn follow_limits(&mut self, at: LatLon) {
+        let now = self.now;
+        // Navigating with the route's roads known: no need to ask the map as we go.
+        if let Some(nav) = &self.nav {
+            if let Some(Some(road)) = self.route_roads.get(nav.point_index()).cloned() {
+                if let Some(event) = self.limits.on_road(road, now) {
+                    self.limit_event(event);
+                }
+                return self.limit_speed();
+            }
+        }
+        if self.demo_active {
+            return self.limit_speed();
+        }
+        let riding = self.link == Link::Online || self.speed_kmh.is_some_and(|s| s > MOVING_KMH);
+        let due = match self.road_asked {
+            Some((from, when)) => now - when >= ROAD_EVERY_S && geo::distance_m(from, at) >= ROAD_EVERY_M,
+            None => true,
+        };
+        if riding && due && !self.road_pending && (self.settings.say_limits || self.screen_on) {
+            self.road_asked = Some((at, now));
+            self.road_pending = true;
+            let url = self.map.road_url(at, self.heading_deg);
+            self.push(Command::Fetch { key: "road".to_string(), url });
+        }
+        self.limit_speed();
+    }
+
+    fn limit_speed(&mut self) {
+        if let Some(event) = self.limits.on_speed(self.speed_kmh, self.now) {
+            self.limit_event(event);
+        }
+    }
+
+    fn limit_event(&mut self, event: LimitEvent) {
+        match event {
+            LimitEvent::NewLimit { limit, road } if self.settings.say_limits => {
+                let text = if road.is_empty() {
+                    tf("Speed limit {}.", &[&limit])
+                } else {
+                    tf("{}: speed limit {}.", &[&road, &limit])
+                };
+                self.say(text, false);
+            }
+            LimitEvent::TooFast { limit } if self.settings.warn_speeding => {
+                self.say(tf("Slow down: the limit here is {}.", &[&limit]), true);
+            }
+            _ => {}
+        }
+    }
+
+    /// The answer to a `Command::Fetch`.
+    pub fn on_fetch(&mut self, key: &str, reply: Result<&str, &str>) {
+        match key {
+            "road" => {
+                self.road_pending = false;
+                if let Ok(Some(road)) = reply.map_err(str::to_string).and_then(|json| self.map.parse_road(json)) {
+                    if let Some(event) = self.limits.on_road(road, self.now) {
+                        self.limit_event(event);
+                    }
+                }
+            }
+            "route_roads" => {
+                let points = self.nav.as_ref().map_or(0, |n| n.route.points.len());
+                if let Ok(roads) = reply.map_err(str::to_string).and_then(|json| self.map.parse_route_roads(json, points)) {
+                    self.route_roads = roads;
+                }
+            }
+            "reach" => {
+                self.reach_pending = false;
+                match reply.map_err(str::to_string).and_then(|json| self.map.parse_reach(json)) {
+                    Ok(rings) if !rings.is_empty() => self.reach = rings,
+                    _ => self.reach.clear(), // the screen draws a plain circle instead
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ----- How far the battery reaches -----
+
+    /// Asks for the area reachable on roads with the range left, when the map is on screen. Until it arrives (or
+    /// without internet) the screen shows a circle of the range.
+    pub fn want_reach(&mut self) {
+        let (Some(at), Some(km)) = (self.gps, self.range_km()) else {
+            return;
+        };
+        if self.reach_pending {
+            return;
+        }
+        let fresh = match self.reach_for {
+            Some((from, range, when)) => {
+                geo::distance_m(from, at) < REACH_AGAIN_KM * 1000.0 && (range - km).abs() < REACH_AGAIN_KM
+                    || self.now - when < REACH_EVERY_S
+            }
+            None => false,
+        };
+        if fresh {
+            return;
+        }
+        self.reach_for = Some((at, km, self.now));
+        self.reach_pending = true;
+        let url = self.map.reach_url(at, km);
+        self.push(Command::Fetch { key: "reach".to_string(), url });
+    }
+
+    /// The range around the rider as a ring, for when the road-reachable area isn't known.
+    pub fn range_ring(&self) -> Option<Vec<LatLon>> {
+        Some(geo::circle(self.gps?, self.range_km()? * 1000.0, 72))
+    }
+
+    // ----- Saved places -----
+
+    pub fn save_bookmark(&mut self, kind: BookmarkKind, place: &Place) {
+        self.settings.bookmarks.save(kind, place.clone());
+        self.save_settings();
+        self.snack = Some(match kind {
+            BookmarkKind::Home => t("Saved as Home.").to_string(),
+            BookmarkKind::Work => t("Saved as Work.").to_string(),
+            BookmarkKind::Other => tf("Saved {}.", &[&place.name]),
+        });
+    }
+
+    pub fn remove_bookmark(&mut self, index: usize) {
+        self.settings.bookmarks.remove(index);
+        self.save_settings();
+    }
+
+    /// Saves the spot under a name the rider types (from a long press on the map).
+    pub fn ask_bookmark_name(&mut self, at: LatLon) {
+        self.pending_bookmark = Some(at);
+        self.ask_text("bookmark", t("Save this place"), t("Name"));
     }
 
     // ----- Notifications and calls -----
@@ -1546,6 +1856,9 @@ impl Engine {
         nav.along_m = crate::demo::START_ALONG_M;
         self.nav = Some(nav);
         self.set_link(Link::Online);
+        // A made-up limit, so the demo shows the speed-limit sign (it never asks the map: the ride isn't real).
+        self.limits.reset();
+        self.limits.on_road(Road { way: 1, name: String::new(), limit: Some(50) }, self.now - 60.0);
         let (vehicle, records) = crate::demo::records();
         for frame in proto::build_records_frames(&vehicle, &records[0], 0).iter().chain(proto::build_records_frames(&vehicle, &records[1], 0).iter()) {
             self.on_rx(frame);
@@ -1617,6 +1930,7 @@ impl Engine {
 
     pub fn tick(&mut self, now: f64) {
         self.now = now;
+        self.update_power();
         self.finish_notif_bursts();
         if let Some(mut demo) = self.demo.take() {
             demo.step(self, now);
@@ -1625,10 +1939,14 @@ impl Engine {
         }
         self.check_ride_end();
         match self.link {
-            Link::Scanning | Link::Connecting | Link::LoggingIn if now - self.link_since > CONNECT_TIMEOUT_S => {
-                if self.link == Link::LoggingIn {
-                    self.push(Command::Disconnect);
-                }
+            Link::Scanning if now - self.link_since > SCAN_GIVE_UP_S => {
+                self.push(Command::StopScan);
+                self.set_link(Link::NotFound);
+            }
+            // The moped didn't answer: it's probably off. Its address is known, so wait for it without searching.
+            Link::Connecting if now - self.link_since > CONNECT_TIMEOUT_S => self.wait_for_moped(),
+            Link::LoggingIn if now - self.link_since > CONNECT_TIMEOUT_S => {
+                self.push(Command::Disconnect);
                 self.connect();
             }
             Link::Online => {
@@ -1655,6 +1973,16 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The next command, leaving out the power level and background map requests, which have their own tests.
+    fn next_command(e: &mut Engine) -> Option<Command> {
+        loop {
+            match e.poll_command() {
+                Some(Command::SetPower(_) | Command::Fetch { .. }) => continue,
+                other => return other,
+            }
+        }
+    }
     use crate::nav::{Maneuver, Route};
     use crate::protocol::{build_frame, build_live_frame, Pack};
 
@@ -1685,7 +2013,7 @@ mod tests {
 
     fn speech(e: &mut Engine) -> Vec<String> {
         let mut out = Vec::new();
-        while let Some(c) = e.poll_command() {
+        while let Some(c) = next_command(e) {
             if let Command::Speak { text, .. } = c {
                 out.push(text);
             }
@@ -1701,7 +2029,7 @@ mod tests {
         let accept = build_frame(proto::START_LOGIN_RESULT, &[(proto::GROUP_LOGIN_RESULT, vec![1])], 0);
         e.on_rx(&accept);
         assert_eq!(e.link, Link::Online);
-        while e.poll_command().is_some() {}
+        while next_command(&mut e).is_some() {}
         e
     }
 
@@ -1720,9 +2048,9 @@ mod tests {
         e.on_update_reply(Ok(reply));
         assert_eq!(e.update_state, UpdateState::Available);
         assert_eq!(e.update.as_ref().unwrap().version, "99.0.0");
-        while e.poll_command().is_some() {}
+        while next_command(&mut e).is_some() {}
         e.install_update();
-        assert!(matches!(e.poll_command(), Some(Command::InstallUpdate { .. })));
+        assert!(matches!(next_command(&mut e), Some(Command::InstallUpdate { .. })));
     }
 
     #[test]
@@ -1731,7 +2059,7 @@ mod tests {
         let day = |day| ClockTime { year: 2026, month: 11, day, hour: 9, minute: 0, second: 0 };
         let checks = |e: &mut Engine| {
             let mut count = 0;
-            while let Some(command) = e.poll_command() {
+            while let Some(command) = next_command(e) {
                 count += usize::from(matches!(command, Command::CheckUpdate { .. }));
             }
             count
@@ -1765,22 +2093,22 @@ mod tests {
         assert_eq!(e.link, Link::NeedsPairing);
         assert!(e.set_pairing_code(CODE));
         assert_eq!(e.link, Link::Scanning);
-        assert_eq!(e.poll_command(), Some(Command::Scan));
+        assert_eq!(next_command(&mut e), Some(Command::Scan));
         e.on_ble_found("SomeHeadphones", "00:11");
         assert!(e.found_devices.is_empty());
         e.on_ble_found("YSCCU_ABCDEFGHIJKLMN", "AA:BB");
         assert_eq!(e.link, Link::Connecting);
-        assert_eq!(e.poll_command(), Some(Command::StopScan));
-        assert_eq!(e.poll_command(), Some(Command::Connect("AA:BB".to_string())));
+        assert_eq!(next_command(&mut e), Some(Command::StopScan));
+        assert_eq!(next_command(&mut e), Some(Command::Connect("AA:BB".to_string())));
         e.on_ble_ready();
-        let Some(Command::Write(first)) = e.poll_command() else {
+        let Some(Command::Write(first)) = next_command(&mut e) else {
             panic!("expected the login");
         };
         assert_eq!(&first[5..19], b"ABCDEFGHIJKLMN");
         assert_eq!(first[57], 1);
         // Reconnecting in the same run uses the zeroed form.
         e.on_ble_ready();
-        let Some(Command::Write(second)) = e.poll_command() else {
+        let Some(Command::Write(second)) = next_command(&mut e) else {
             panic!("expected the login");
         };
         assert_eq!(&second[5..19], b"00000000000000");
@@ -2169,11 +2497,11 @@ mod tests {
         e.settings.dash_calls = false;
         e.on_clock(ClockTime { year: 2026, month: 1, day: 2, hour: 3, minute: 4, second: 5 });
         e.on_call(CallState::Ringing);
-        while e.poll_command().is_some() {}
+        while next_command(&mut e).is_some() {}
         e.tick(100.0);
         e.tick(100.1);
         let mut flags = None;
-        while let Some(command) = e.poll_command() {
+        while let Some(command) = next_command(&mut e) {
             if let Command::Write(bytes) = command {
                 if bytes[2..4] == [0x05, 0x8B] {
                     flags = Some(u16::from_be_bytes([bytes[5], bytes[6]]));
@@ -2190,41 +2518,121 @@ mod tests {
         e.settings.update_auto = false;
         e.on_clock(ClockTime { year: 2026, month: 1, day: 2, hour: 3, minute: 4, second: 5 });
         e.tick(100.0);
-        let Some(Command::Write(clock)) = e.poll_command() else {
+        let Some(Command::Write(clock)) = next_command(&mut e) else {
             panic!("expected the clock");
         };
         assert_eq!(&clock[2..4], &[0x05, 0x8A]);
-        assert!(e.poll_command().is_none());
+        assert!(next_command(&mut e).is_none());
         e.tick(100.1);
-        let Some(Command::Write(flags)) = e.poll_command() else {
+        let Some(Command::Write(flags)) = next_command(&mut e) else {
             panic!("expected the flags");
         };
         assert_eq!(&flags[2..4], &[0x05, 0x8B]);
         e.tick(100.5);
-        assert!(e.poll_command().is_none());
+        assert!(next_command(&mut e).is_none());
         e.tick(101.0);
-        assert!(matches!(e.poll_command(), Some(Command::Write(_))));
+        assert!(matches!(next_command(&mut e), Some(Command::Write(_))));
     }
 
     #[test]
-    fn stalled_connection_retries_after_the_timeout() {
+    fn a_first_search_gives_up_instead_of_scanning_forever() {
         let mut e = Engine::new();
         e.set_pairing_code(CODE);
-        while e.poll_command().is_some() {}
-        e.tick(5.0);
-        assert!(e.poll_command().is_none());
+        while next_command(&mut e).is_some() {}
         e.tick(16.0);
-        assert_eq!(e.poll_command(), Some(Command::Scan));
+        assert!(next_command(&mut e).is_none());
+        assert_eq!(e.link, Link::Scanning);
+        e.tick(50.0);
+        assert_eq!(next_command(&mut e), Some(Command::StopScan));
+        assert_eq!(e.link, Link::NotFound);
+        e.tick(500.0);
+        assert!(next_command(&mut e).is_none());
+    }
+
+    #[test]
+    fn a_known_moped_that_doesnt_answer_is_waited_for_quietly() {
+        let mut e = Engine::new();
+        e.set_pairing_code(CODE);
+        e.choose_device("AA:BB");
+        while next_command(&mut e).is_some() {}
+        e.tick(16.0);
+        assert_eq!(next_command(&mut e), Some(Command::WaitFor("AA:BB".to_string())));
+        assert_eq!(e.link, Link::Waiting);
+        // No more searching or reconnecting, however long it waits.
+        for s in 17..600 {
+            e.tick(f64::from(s));
+        }
+        assert!(next_command(&mut e).is_none());
+        // The moped comes back: Android reconnects and the engine signs in.
+        e.on_ble_ready();
+        assert!(matches!(next_command(&mut e), Some(Command::Write(_))));
+    }
+
+    #[test]
+    fn switching_the_moped_off_waits_instead_of_searching() {
+        let mut e = online();
+        e.settings.address = "AA:BB".to_string();
+        while next_command(&mut e).is_some() {}
+        e.on_ble_disconnected();
+        assert_eq!(e.link, Link::Waiting);
+        let mut seen = Vec::new();
+        while let Some(c) = e.poll_command() {
+            seen.push(c);
+        }
+        assert!(seen.contains(&Command::WaitFor("AA:BB".to_string())));
+        assert!(!seen.contains(&Command::Scan));
+    }
+
+    #[test]
+    fn power_follows_what_the_rider_is_doing() {
+        let mut e = Engine::new();
+        e.settings.address = "AA:BB".to_string();
+        e.set_screen_on(false);
+        e.tick(1.0);
+        assert_eq!(e.wanted_power(), Power::Rest);
+        assert_eq!(e.pace_ms(), 1000);
+        e.set_screen_on(true);
+        assert_eq!(e.wanted_power(), Power::Look);
+        let mut e = online();
+        e.set_screen_on(false);
+        assert_eq!(e.wanted_power(), Power::Ride);
+        let mut powers = Vec::new();
+        while let Some(c) = e.poll_command() {
+            if let Command::SetPower(p) = c {
+                powers.push(p);
+            }
+        }
+        assert_eq!(powers.last(), Some(&Power::Ride));
+    }
+
+    #[test]
+    fn speed_limits_are_asked_while_riding_and_said_once() {
+        let mut e = online();
+        e.speed_kmh = Some(30.0);
+        e.tick(10.0);
+        while e.poll_command().is_some() {}
+        e.on_gps((44.4949, 11.3426), Some(8.0));
+        let mut asked = false;
+        while let Some(c) = e.poll_command() {
+            asked |= matches!(c, Command::Fetch { ref key, .. } if key == "road");
+        }
+        assert!(asked);
+        let reply = r#"[{"edges":[{"edge_info":{"way_id":32479333,"names":["Via Ugo Bassi"],"speed_limit":30}}]}]"#;
+        e.on_fetch("road", Ok(reply));
+        e.tick(14.0);
+        e.on_gps((44.4949, 11.3426), Some(8.0));
+        assert_eq!(e.spoken.front().map(String::as_str), Some("Via Ugo Bassi: speed limit 30."));
+        assert_eq!(e.limits.limit(), Some(30));
     }
 
     #[test]
     fn route_needs_gps_and_waits_for_it() {
         let mut e = online();
-        e.navigate_to(&Place { name: "Home".to_string(), at: (48.1, 2.1) });
+        e.navigate_to(&Place::new("Home", (48.1, 2.1)));
         assert_eq!(e.nav_status, "Waiting for GPS...");
-        assert!(e.poll_command().is_none());
+        assert!(next_command(&mut e).is_none());
         e.on_gps((48.0, 2.0), Some(5.0));
-        assert!(matches!(e.poll_command(), Some(Command::FetchRoute { .. })));
+        assert!(matches!(next_command(&mut e), Some(Command::FetchRoute { .. })));
         assert_eq!(e.speed_kmh, Some(18.0));
     }
 
@@ -2242,7 +2650,7 @@ mod tests {
     const NO_PATH: &str = r#"{"error_code":442,"error":"No path could be found for input"}"#;
 
     fn route_url(e: &mut Engine) -> String {
-        match e.poll_command() {
+        match next_command(e) {
             Some(Command::FetchRoute { url, .. }) => url,
             other => panic!("expected a route request, got {other:?}"),
         }
@@ -2252,13 +2660,13 @@ mod tests {
     fn unreachable_destination_retries_once_for_the_nearest_road() {
         let mut e = online();
         e.on_gps((48.0, 2.0), None);
-        e.navigate_to(&Place { name: "Palace".to_string(), at: (48.1, 2.1) });
+        e.navigate_to(&Place::new("Palace", (48.1, 2.1)));
         assert!(!route_url(&mut e).contains("radius"));
         e.on_route_reply(Ok(NO_PATH), "Palace");
         assert!(route_url(&mut e).contains("radius"));
         // The second refusal is final, and it says so.
         e.on_route_reply(Ok(NO_PATH), "Palace");
-        assert!(e.poll_command().is_some());
+        assert!(next_command(&mut e).is_some());
         assert!(e.nav_status.starts_with("No route"));
     }
 
@@ -2266,7 +2674,7 @@ mod tests {
     fn reply_after_stopping_navigation_is_ignored() {
         let mut e = online();
         e.on_gps((48.0, 2.0), None);
-        e.navigate_to(&Place { name: "Home".to_string(), at: (48.1, 2.1) });
+        e.navigate_to(&Place::new("Home", (48.1, 2.1)));
         e.stop_navigation();
         let json = r#"{"trip":{"summary":{"time":120.0},"legs":[{"shape":"_p~iF~ps|U_ulLnnqC",
           "maneuvers":[{"type":1,"instruction":"Go.","begin_shape_index":0}]}]}}"#;
@@ -2357,9 +2765,9 @@ mod tests {
     fn recent_places_stay_unique_newest_first_and_capped() {
         let mut e = online();
         for i in 0..7 {
-            e.navigate_to(&Place { name: format!("Place {i}"), at: (48.0, 2.0) });
+            e.navigate_to(&Place::new(&format!("Place {i}"), (48.0, 2.0)));
         }
-        e.navigate_to(&Place { name: "Place 3".to_string(), at: (48.0, 2.0) });
+        e.navigate_to(&Place::new("Place 3", (48.0, 2.0)));
         let names: Vec<&str> = e.settings.recents.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["Place 3", "Place 6", "Place 5", "Place 4", "Place 2"]);
     }
@@ -2431,7 +2839,7 @@ mod tests {
         s.moped_color = MopedColor::Black;
         s.high_contrast = true;
         s.language = Some(Lang::It);
-        s.recents = vec![Place { name: "Home; sweet, home".to_string(), at: (48.5, 16.25) }];
+        s.recents = vec![Place::new("Home; sweet, home", (48.5, 16.25))];
         let back = Settings::from_text(&s.to_text());
         assert_eq!(back.ccu_id, "ABC");
         assert_eq!(back.passkey, "123");
