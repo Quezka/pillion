@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.1] - 2026-11-09
+
+- Liquid glass done properly, the Apple way: backgrounds are plain and cards solid again (the colour wash is gone),
+  and the map's buttons are glass. What shows through them is the real map underneath, blurred, with a bright rim
+  and a soft shadow.
+
 ## [0.3.0] - 2026-11-08
 
 - When the moped is switched off, Pillion stops looking for it. It leaves one low-power request with the phone's

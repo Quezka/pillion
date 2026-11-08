@@ -66,13 +66,11 @@ pub fn label(ui: &mut Ui, th: &Tokens, value: &str) {
 fn card_frame(th: &Tokens, fill: Color32) -> Frame {
     let stroke = if th.outlined {
         Stroke::new(1.5, th.border)
-    } else if th.glass {
-        Stroke::new(1.0, th.glass_edge)
     } else {
         Stroke::NONE
     };
     Frame::new()
-        .fill(crate::ui::theme::frosted(th, fill))
+        .fill(fill)
         .stroke(stroke)
         .corner_radius(CornerRadius::same(CARD_RADIUS))
         .inner_margin(Margin::same(16))
@@ -96,10 +94,10 @@ pub fn hero(ui: &mut Ui, th: &Tokens, add: impl FnOnce(&mut Ui)) {
     ui.add_space(10.0);
 }
 
-/// A frosted rounded panel painted straight onto the screen (map buttons, the search bar).
+/// A raised rounded panel painted straight onto the screen (the search bar). Glass over the map is `map::glass_button`.
 pub fn glass_panel(painter: &eframe::egui::Painter, rect: Rect, radius: u8, th: &Tokens) {
     let round = CornerRadius::same(radius);
-    painter.rect_filled(rect, round, if th.glass { th.surface.gamma_multiply(0.82) } else { th.raised });
+    painter.rect_filled(rect, round, th.surface);
     let edge = if th.outlined { Stroke::new(1.5, th.border) } else if th.glass { Stroke::new(1.0, th.glass_edge) } else { Stroke::NONE };
     painter.rect_stroke(rect, round, edge, StrokeKind::Inside);
 }
@@ -269,14 +267,8 @@ pub fn filter_chip(ui: &mut Ui, th: &Tokens, value: &str, chosen: bool) -> bool 
 /// A square tile with a big value and a label.
 pub fn tile(ui: &mut Ui, th: &Tokens, glyph: &'static str, value: &str, caption: &str) {
     Frame::new()
-        .fill(crate::ui::theme::frosted(th, th.surface))
-        .stroke(if th.outlined {
-            Stroke::new(1.5, th.border)
-        } else if th.glass {
-            Stroke::new(1.0, th.glass_edge)
-        } else {
-            Stroke::NONE
-        })
+        .fill(th.surface)
+        .stroke(if th.outlined { Stroke::new(1.5, th.border) } else { Stroke::NONE })
         .corner_radius(CornerRadius::same(16))
         .inner_margin(Margin::symmetric(14, 12))
         .show(ui, |ui| {

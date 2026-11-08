@@ -1458,27 +1458,27 @@ impl eframe::App for CompanionApp {
             self.ask_typed(prompt.0, prompt.1);
         }
         let th = theme::with_glass(theme::tokens(is_dark(&ctx, &engine), engine.settings.high_contrast), engine.settings.glass);
-        theme::paint_wash(&ctx.layer_painter(egui::LayerId::background()), ctx.content_rect(), &th);
+        theme::paint_background(&ctx.layer_painter(egui::LayerId::background()), ctx.content_rect(), &th);
         ctx.set_visuals(if th.dark { egui::Visuals::dark() } else { egui::Visuals::light() });
 
         let scale = ctx.pixels_per_point();
         let (bar_top, bar_bottom) = engine.system_bars_px;
         Panel::bottom("tabs")
-            .frame(Frame::new().fill(theme::frosted(&th, th.sidebar)).stroke(if th.glass { Stroke::new(1.0, th.glass_edge) } else { Stroke::NONE }))
+            .frame(Frame::new().fill(th.sidebar))
             .show_separator_line(false)
             .show(ui, |ui| {
                 self.nav_bar(ui, &th);
                 ui.add_space(bar_bottom / scale);
             });
         Panel::top("title")
-            .frame(Frame::new().fill(if th.glass { Color32::TRANSPARENT } else { th.bg }).inner_margin(Margin::symmetric(14, 4)))
+            .frame(Frame::new().fill(th.bg).inner_margin(Margin::symmetric(14, 4)))
             .show_separator_line(false)
             .show(ui, |ui| {
                 ui.add_space(bar_top / scale);
                 self.top_bar(ui, &engine, &th);
             });
         CentralPanel::default()
-            .frame(Frame::new().fill(if th.glass { Color32::TRANSPARENT } else { th.bg }).inner_margin(Margin::symmetric(14, 4)))
+            .frame(Frame::new().fill(th.bg).inner_margin(Margin::symmetric(14, 4)))
             .show(ui, |ui| {
                 let area = ui.max_rect().expand2(Vec2::new(14.0, 4.0));
                 let age = ui.input(|i| i.time) - self.changed_screen_at;

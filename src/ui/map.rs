@@ -28,6 +28,8 @@ const HEADING_EASE: f32 = 0.12;
 const WHEEL_ZOOM: f32 = 0.004;
 /// Where the map starts when there's no GPS yet: Bologna, near the owner.
 const NO_GPS_START: LatLon = (44.4949, 11.3426);
+/// How many zoom levels lower the map picture under a glass button is: each level halves the detail.
+const GLASS_BLUR_LEVELS: u8 = 3;
 
 /// The street map: its pictures, and how it's looking.
 #[derive(Default)]
@@ -515,7 +517,7 @@ impl CompanionApp {
             let centre = rect.right_top() + Vec2::new(-34.0, 34.0 + i as f32 * 56.0);
             let area = Rect::from_center_size(centre, Vec2::splat(48.0));
             let hit = ui.interact(area, ui.scope_id().with(("map-button", what)), Sense::click());
-            m3::glass_panel(&painter, area, 24, th);
+            self.glass_button(&painter, centre, 24.0, &view, engine, th);
             icon(&painter, Rect::from_center_size(centre, Vec2::splat(24.0)), glyph, false, th.accent);
             if hit.clicked() {
                 engine.tick_haptic();
@@ -542,6 +544,57 @@ impl CompanionApp {
         painter.galley(back.min + Vec2::splat(3.0), galley, th.muted);
         painter.rect_stroke(rect, round, Stroke::new(1.0, th.glass_edge), egui::StrokeKind::Inside);
         ui.add_space(12.0);
+    }
+}
+
+impl CompanionApp {
+    /// A round glass button over the map. What shows through is the real map under it, blurred: the same place
+    /// from a map picture three zoom levels lower, stretched up, so its detail melts into colour. Then a light tint,
+    /// a bright rim along the top and a soft shadow.
+    fn glass_button(&self, painter: &egui::Painter, centre: Pos2, radius: f32, view: &View, engine: &mut Engine, th: &Tokens) {
+        if !th.glass {
+            painter.circle_filled(centre, radius, th.surface);
+            if th.outlined {
+                painter.circle_stroke(centre, radius - 0.75, Stroke::new(1.5, th.border));
+            }
+            return;
+        }
+        painter.circle_filled(centre + Vec2::new(0.0, 2.0), radius + 1.0, Color32::from_black_alpha(46));
+        let low = view.level().saturating_sub(GLASS_BLUR_LEVELS).max(ZOOM_RANGE.0 as u8);
+        let under = map_position(view.to_place(centre), low);
+        let key = (low, under.x.floor().max(0.0) as u32, under.y.floor().max(0.0) as u32);
+        engine.want_tile(key);
+        if let Some(texture) = self.map.tiles.get(&key) {
+            let corner = Vec2::new(key.1 as f32, key.2 as f32);
+            let uv = |q: Pos2| {
+                let m = map_position(view.to_place(q), low) - corner;
+                Pos2::new(m.x.clamp(0.0, 1.0), m.y.clamp(0.0, 1.0))
+            };
+            let mut mesh = egui::Mesh::with_texture(texture.id());
+            mesh.vertices.push(egui::epaint::Vertex { pos: centre, uv: uv(centre), color: Color32::WHITE });
+            const SIDES: u32 = 40;
+            for i in 0..=SIDES {
+                let a = i as f32 / SIDES as f32 * std::f32::consts::TAU;
+                let q = centre + Vec2::new(a.cos(), a.sin()) * radius;
+                mesh.vertices.push(egui::epaint::Vertex { pos: q, uv: uv(q), color: Color32::WHITE });
+                if i > 0 {
+                    mesh.add_triangle(0, i, i + 1);
+                }
+            }
+            painter.add(egui::Shape::mesh(mesh));
+            painter.circle_filled(centre, radius, th.surface.gamma_multiply(if th.dark { 0.42 } else { 0.48 }));
+        } else {
+            painter.circle_filled(centre, radius, th.surface.gamma_multiply(0.9));
+        }
+        // The light along the top edge, fading towards the sides.
+        let rim: Vec<Pos2> = (0..=24)
+            .map(|i| {
+                let a = std::f32::consts::PI * (1.15 + 0.7 * i as f32 / 24.0);
+                centre + Vec2::new(a.cos(), a.sin()) * (radius - 1.5)
+            })
+            .collect();
+        painter.add(egui::Shape::line(rim, Stroke::new(1.5, Color32::from_white_alpha(if th.dark { 90 } else { 220 }))));
+        painter.circle_stroke(centre, radius - 0.5, Stroke::new(1.0, if th.dark { Color32::from_white_alpha(40) } else { Color32::from_black_alpha(30) }));
     }
 }
 

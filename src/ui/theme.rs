@@ -153,32 +153,15 @@ pub fn mix(a: Color32, b: Color32, amount: f32) -> Color32 {
     Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
 }
 
-/// A surface colour: see-through with glass, solid without.
-pub fn frosted(th: &Tokens, colour: Color32) -> Color32 {
-    if th.glass {
-        let alpha = if th.dark { 0.68 } else { 0.70 };
-        colour.gamma_multiply(alpha)
-    } else {
-        colour
-    }
+/// A content surface. Content stays solid, as in Apple's glass design: only chrome over content is glass (the map's
+/// buttons, see `ui/map.rs`).
+pub fn frosted(_th: &Tokens, colour: Color32) -> Color32 {
+    colour
 }
 
-/// Paints the colour wash behind everything: the accent from the top left, a warm glow at the bottom right.
-pub fn paint_wash(painter: &Painter, rect: Rect, th: &Tokens) {
+/// The plain background behind everything (no colour wash: glass shows real content, never an invented backdrop).
+pub fn paint_background(painter: &Painter, rect: Rect, th: &Tokens) {
     painter.rect_filled(rect, 0.0, th.bg);
-    if !th.glass {
-        return;
-    }
-    let a = mix(th.bg, th.accent, if th.dark { 0.22 } else { 0.18 });
-    let b = mix(th.bg, th.glow, if th.dark { 0.14 } else { 0.11 });
-    let mut mesh = egui::Mesh::default();
-    let corners = [(rect.left_top(), a), (rect.right_top(), th.bg), (rect.right_bottom(), b), (rect.left_bottom(), th.bg)];
-    for (pos, colour) in corners {
-        mesh.colored_vertex(pos, colour);
-    }
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(0, 2, 3);
-    painter.add(egui::Shape::mesh(mesh));
 }
 
 #[derive(Clone, Copy)]
