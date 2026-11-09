@@ -41,16 +41,16 @@ const fn hex(rgb: u32) -> Color32 {
 }
 
 pub const LIGHT: Tokens = Tokens {
-    bg: hex(0xf3f2ff),
+    bg: hex(0xf4f4f2),
     surface: hex(0xffffff),
-    raised: hex(0xe9e8ff),
-    sidebar: hex(0xeceaff),
-    border: hex(0xb3b6cc),
-    text: hex(0x0b0d14),
-    muted: hex(0x343b4d),
-    faint: hex(0x4d5466),
+    raised: hex(0xebebe8),
+    sidebar: hex(0xeeeeeb),
+    border: hex(0xb4b4ae),
+    text: hex(0x111111),
+    muted: hex(0x3c3c39),
+    faint: hex(0x52524e),
     accent: hex(0x4f46e5),
-    accent_soft: hex(0xdcdbff),
+    accent_soft: hex(0xe3e2fb),
     on_accent: hex(0xffffff),
     on_accent_soft: hex(0x1e1a78),
     danger: hex(0xd0262d),
@@ -64,16 +64,16 @@ pub const LIGHT: Tokens = Tokens {
 };
 
 pub const DARK: Tokens = Tokens {
-    bg: hex(0x0e0e19),
-    surface: hex(0x1a1a2b),
-    raised: hex(0x27273f),
-    sidebar: hex(0x13131f),
-    border: hex(0x4b4e66),
-    text: hex(0xf6f7fb),
-    muted: hex(0xcbcfdd),
-    faint: hex(0xa2a8bb),
+    bg: hex(0x111112),
+    surface: hex(0x1c1c1e),
+    raised: hex(0x2a2a2d),
+    sidebar: hex(0x161618),
+    border: hex(0x4b4b50),
+    text: hex(0xf5f5f4),
+    muted: hex(0xd0d0cc),
+    faint: hex(0xa9a9a5),
     accent: hex(0xa9a6ff),
-    accent_soft: hex(0x3b3984),
+    accent_soft: hex(0x37356e),
     on_accent: hex(0x0b0b14),
     on_accent_soft: hex(0xe4e3ff),
     danger: hex(0xff7b80),
@@ -261,10 +261,10 @@ mod tests {
 
     #[test]
     fn colours_are_the_kits() {
-        // suite-kit 0.8 (brighter, with glass).
+        // The suite tokens (suite-rs/design/tokens.json, written here by tools/gen_tokens.py).
         assert_eq!(LIGHT.accent, Color32::from_rgb(0x4f, 0x46, 0xe5));
         assert!(LIGHT.glass && !tokens(false, true).glass);
-        assert_eq!(DARK.bg, Color32::from_rgb(0x0e, 0x0e, 0x19));
+        assert_eq!(DARK.bg, Color32::from_rgb(0x11, 0x11, 0x12));
         assert!(tokens(true, true).outlined);
         assert!(!tokens(false, false).dark);
     }
