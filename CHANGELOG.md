@@ -1,8 +1,8 @@
 # Changelog
 
-## [0.5.1] - 2026-11-09
+## [0.6.1] - 2026-11-09
 
-- The suite's new shared look (0.5.0 didn't build: its licence notices were out of date).
+- Brings 0.5.0 (the suite's new shared look) and 0.6.0 (pick the voice, quiet off the moped) to phones: neither built, because the licence notices were out of date.
 
 ## [0.6.0] - 2026-11-09
 
