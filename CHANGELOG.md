@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.5.0] - 2026-11-09
+
+- The suite's new shared look: neutral greys instead of blue-tinted ones, with indigo kept as the one accent colour.
+
 ## [0.4.0] - 2026-11-09
 
 - The Route tab is a full-screen map, and everything over it is liquid glass: the title bar, the tabs, the search bar
