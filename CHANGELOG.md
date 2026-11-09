@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0] - 2026-11-09
+
+- Pick the voice on the Voice tab: "Best" (the phone's own voice when it's a good one, such as Google's, otherwise the
+  natural voice), "Phone's" or "Natural". Best is the new default. If one voice fails on a sentence, the other says it.
+- Pillion only talks while the moped is connected (or on the demo ride). Off the moped it stays quiet, apart from
+  "connection lost", Bluetooth problems and what you ask for with the earpiece button. Everything still goes in "Last said".
+
 ## [0.5.0] - 2026-11-09
 
 - The suite's new shared look: neutral greys instead of blue-tinted ones, with indigo kept as the one accent colour.

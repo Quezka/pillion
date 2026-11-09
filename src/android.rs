@@ -66,7 +66,7 @@ fn encode(command: Command) -> String {
         Command::InstallUpdate { url, sha256 } => vec!["update_install".into(), url, sha256],
         Command::VoiceDownload => vec!["voice_download".into()],
         Command::VoiceRemove => vec!["voice_remove".into()],
-        Command::VoiceNatural(on) => vec!["voice_natural".into(), u8::from(on).to_string()],
+        Command::VoiceEngine(engine) => vec!["voice_engine".into(), engine.code().into()],
         Command::FetchTile { z, x, y } => vec!["tile".into(), z.to_string(), x.to_string(), y.to_string()],
         Command::Share(text) => vec!["share".into(), text],
         Command::OpenNotificationAccess => vec!["notif_access".into()],

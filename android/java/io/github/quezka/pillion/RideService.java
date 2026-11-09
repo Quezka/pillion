@@ -373,8 +373,8 @@ public class RideService extends Service {
             case "voice_remove":
                 voice.removePack();
                 break;
-            case "voice_natural":
-                voice.setNaturalWanted("1".equals(f[1]));
+            case "voice_engine":
+                voice.setEngine(f[1]);
                 break;
             case "tile":
                 fetchTile(f[1], f[2], f[3]);

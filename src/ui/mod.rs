@@ -16,7 +16,7 @@ use eframe::egui::{
     Rect, ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2,
 };
 
-use crate::engine::{Appearance, BluetoothState, Engine, Link, MopedColor, NotifLevel, UpdateState, VoicePack};
+use crate::engine::{Appearance, BluetoothState, Engine, Link, MopedColor, NotifLevel, UpdateState, VoiceEngine, VoicePack};
 use crate::locale::{self, t, tf, Lang};
 use m3::{text, Kind};
 use model3d::Scene;
@@ -708,15 +708,23 @@ impl CompanionApp {
 
     fn natural_voice_card(ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
         m3::card(ui, th, |ui| {
-            m3::label(ui, th, t("Natural voice"));
+            m3::label(ui, th, t("Which voice"));
+            let engines = [VoiceEngine::Auto, VoiceEngine::System, VoiceEngine::Natural];
+            let selected = engines.iter().position(|v| *v == engine.settings.voice_engine).unwrap_or(0);
+            if let Some(i) = m3::segmented(ui, th, &[t("Best"), t("Phone's"), t("Natural")], selected) {
+                engine.set_voice_engine(engines[i]);
+                engine.test_voice();
+            }
+            ui.add_space(6.0);
+            m3::small(ui, th, match engine.settings.voice_engine {
+                VoiceEngine::Auto => t("Uses the phone's own voice when it has a good one, otherwise the natural voice."),
+                VoiceEngine::System => t("The phone's own voice. Change it in Android's text-to-speech settings."),
+                VoiceEngine::Natural => t("The natural voice, downloaded once, runs with no internet."),
+            });
+            ui.add_space(8.0);
             match engine.voice_pack {
                 VoicePack::Ready => {
-                    let on = engine.settings.natural_voice;
-                    if m3::switch_row(ui, th, t("Use the natural voice"), on) {
-                        engine.set_natural_voice(!on);
-                    }
-                    ui.add_space(4.0);
-                    if m3::button(ui, th, t("Remove the voice"), Some("x"), Kind::Outlined, 44.0) {
+                    if m3::button(ui, th, t("Remove the natural voice"), Some("x"), Kind::Outlined, 44.0) {
                         engine.remove_voice();
                     }
                 }
@@ -729,13 +737,15 @@ impl CompanionApp {
                     let failed = engine.voice_pack == VoicePack::Failed;
                     if failed {
                         ui.label(text(t("The download failed. Check the internet connection."), 14.0, th.warning, Weight::Medium));
-                    } else {
+                    } else if engine.settings.voice_engine != VoiceEngine::System {
                         m3::body(ui, th, t("A much clearer voice that runs on the phone, with no internet. It's a single download of about 70 MB, best on Wi-Fi."));
                     }
-                    ui.add_space(8.0);
-                    let name = if failed { t("Try again") } else { t("Download the voice") };
-                    if m3::button(ui, th, name, Some("voice"), Kind::Filled, 46.0) {
-                        engine.download_voice();
+                    if engine.settings.voice_engine != VoiceEngine::System {
+                        ui.add_space(8.0);
+                        let name = if failed { t("Try again") } else { t("Download the voice") };
+                        if m3::button(ui, th, name, Some("voice"), Kind::Filled, 46.0) {
+                            engine.download_voice();
+                        }
                     }
                 }
             }

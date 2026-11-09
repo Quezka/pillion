@@ -19,12 +19,16 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.security.MessageDigest;
 import java.util.ArrayDeque;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Locale;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * The voice. A natural voice runs on the phone once it's downloaded, and needs no internet. Until then Android's own speech
- * is used, with the best voice it has. Either way Android sends it to the connected earpiece, and music dips while it talks.
+ * The voice. The rider picks it: the phone's own speech (with the best voice it has), the natural voice (runs on the phone
+ * once downloaded, no internet), or "best", which takes the phone's voice when it's a good one and the natural voice otherwise.
+ * If one engine fails on a sentence, the other one says it. Either way Android sends it to the connected earpiece, and music dips while it talks.
  */
 final class Voice {
     private static final String UTTERANCE = "ride";
@@ -56,7 +60,13 @@ final class Voice {
     private Locale language = Locale.UK;
     private String code = "en";
     private float rate = 1f;
-    private volatile boolean naturalWanted = true;
+    /** "auto", "system" or "natural". */
+    private volatile String engine = "auto";
+    /** How good the phone's chosen voice is, from Android's quality scale; 0 when it has none for this language. */
+    private volatile int systemQuality;
+    private volatile boolean systemBroken;
+    private final Map<String, String> pending = new ConcurrentHashMap<>();
+    private final AtomicInteger nextId = new AtomicInteger();
     private volatile boolean downloading;
     private volatile int generation;
     private OfflineTts natural;
@@ -87,7 +97,12 @@ final class Voice {
                 .build();
         tts = new TextToSpeech(context, status -> {
             if (status != TextToSpeech.SUCCESS) {
+                systemBroken = true;
                 Native.event("voice_missing");
+                // Whatever was waiting goes to the natural voice, if there is one.
+                while (!waiting.isEmpty()) {
+                    sayNaturally(waiting.poll());
+                }
                 return;
             }
             ready = true;
@@ -100,12 +115,18 @@ final class Voice {
 
             @Override
             public void onDone(String id) {
+                pending.remove(id);
                 release();
             }
 
             @Override
             public void onError(String id) {
+                String text = pending.remove(id);
                 release();
+                // The phone's speech couldn't say it: let the natural voice try.
+                if (text != null && packReady(code) && !naturalBroken) {
+                    sayNaturally(text);
+                }
             }
 
             private void release() {
@@ -129,23 +150,38 @@ final class Voice {
 
     private void speak(String text, int mode) {
         audio.requestAudioFocus(focus);
-        tts.speak(text, mode, null, UTTERANCE);
+        String id = UTTERANCE + nextId.getAndIncrement();
+        pending.put(id, text);
+        tts.speak(text, mode, null, id);
     }
 
-    /** Urgent speech, such as a turn or a warning, cuts in ahead of what's being said. */
+    /** Whether this sentence goes to the natural voice rather than the phone's own speech. */
+    private boolean useNatural() {
+        boolean naturalOk = !naturalBroken && packReady(code);
+        switch (engine) {
+            case "natural":
+                return naturalOk || systemBroken;
+            case "system":
+                return systemBroken && naturalOk;
+            default:
+                // The phone's voice is good enough when Android rates it high (Google's voices are) and it's installed.
+                boolean systemGood = !systemBroken && systemQuality >= android.speech.tts.Voice.QUALITY_HIGH;
+                return naturalOk && !systemGood;
+        }
+    }
+
+    /** Urgent speech, such as a turn or a warning, cuts in ahead of what's being said, whichever voice is saying it. */
     void say(String text, boolean urgent) {
-        if (naturalWanted && !naturalBroken && packReady(code)) {
-            if (urgent) {
-                generation++;
-                queue.clear();
-                if (ready) {
-                    tts.stop();
-                }
+        if (urgent) {
+            generation++;
+            queue.clear();
+            if (ready) {
+                tts.stop();
             }
-            // A sentence at a time, so that something urgent never waits long.
-            for (String sentence : text.split("(?<=[.!?])\\s+")) {
-                queue.add(new Spoken(sentence, generation, code));
-            }
+            pending.clear();
+        }
+        if (useNatural()) {
+            sayNaturally(text);
             return;
         }
         if (!ready) {
@@ -153,6 +189,13 @@ final class Voice {
             return;
         }
         speak(text, urgent ? TextToSpeech.QUEUE_FLUSH : TextToSpeech.QUEUE_ADD);
+    }
+
+    private void sayNaturally(String text) {
+        // A sentence at a time, so that something urgent never waits long.
+        for (String sentence : text.split("(?<=[.!?])\\s+")) {
+            queue.add(new Spoken(sentence, generation, code));
+        }
     }
 
     void setLanguage(String next) {
@@ -165,8 +208,13 @@ final class Voice {
     }
 
     private void useLanguage() {
-        tts.setLanguage(language);
-        tts.setVoice(bestAndroidVoice());
+        int result = tts.setLanguage(language);
+        android.speech.tts.Voice best = bestAndroidVoice();
+        if (best != null) {
+            tts.setVoice(best);
+        }
+        boolean missing = result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED;
+        systemQuality = missing || best == null ? 0 : best.getQuality();
     }
 
     /** The clearest voice Android has for this language, preferring one that works without internet. */
@@ -199,8 +247,12 @@ final class Voice {
         tts.setSpeechRate(next);
     }
 
-    void setNaturalWanted(boolean wanted) {
-        naturalWanted = wanted;
+    void setEngine(String next) {
+        engine = next;
+        // A voice installed since the last look gets picked up now.
+        if (ready) {
+            useLanguage();
+        }
     }
 
     // ----- The natural voice -----
@@ -213,7 +265,9 @@ final class Voice {
                     continue;
                 }
                 if (!load(next.language)) {
-                    say(next.text, false);
+                    if (ready) {
+                        speak(next.text, TextToSpeech.QUEUE_ADD);
+                    }
                     continue;
                 }
                 audio.requestAudioFocus(focus);

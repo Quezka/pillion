@@ -82,7 +82,7 @@ pub enum Command {
     InstallUpdate { url: String, sha256: String },
     VoiceDownload,
     VoiceRemove,
-    VoiceNatural(bool),
+    VoiceEngine(VoiceEngine),
     FetchTile { z: u8, x: u32, y: u32 },
     Share(String),
     Haptic,
@@ -184,6 +184,32 @@ pub enum UpdateState {
     InstallFailed,
 }
 
+/// Which speech engine talks. Auto picks the phone's own voice when it has a good one, otherwise the natural voice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoiceEngine {
+    Auto,
+    System,
+    Natural,
+}
+
+impl VoiceEngine {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::System => "system",
+            Self::Natural => "natural",
+        }
+    }
+
+    fn from_code(code: &str) -> Self {
+        match code {
+            "system" => Self::System,
+            "natural" => Self::Natural,
+            _ => Self::Auto,
+        }
+    }
+}
+
 /// Where the natural voice for the current language stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VoicePack {
@@ -221,7 +247,7 @@ pub struct Settings {
     /// Call lights on the dash. The original has this switch too, off until the rider sets it.
     pub dash_calls: bool,
     pub moped_color: MopedColor,
-    pub natural_voice: bool,
+    pub voice_engine: VoiceEngine,
     pub update_auto: bool,
     update_checked_on: String,
     pub appearance: Appearance,
@@ -257,7 +283,7 @@ impl Default for Settings {
             total_kwh: 0.0,
             dash_calls: true,
             moped_color: MopedColor::Teal,
-            natural_voice: true,
+            voice_engine: VoiceEngine::Auto,
             update_auto: true,
             update_checked_on: String::new(),
             appearance: Appearance::System,
@@ -283,10 +309,10 @@ impl Settings {
         let mut muted: Vec<&str> = self.muted_apps.iter().map(String::as_str).collect();
         muted.sort_unstable();
         format!(
-            "update_auto={}\nupdate_checked={}\nnatural_voice={}\nccu={}\npass={}\naddr={}\nvoice={}\nbattery={}\nconsumption={}\nnav={}\ncalls={}\nnotif={}\nrate={}\nmuted={}\nslots={}\ntotal_km={}\ntotal_kwh={}\ndash_calls={}\nmoped_color={}\nappearance={}\ncontrast={}\nlanguage={}\n{}",
+            "update_auto={}\nupdate_checked={}\nvoice_engine={}\nccu={}\npass={}\naddr={}\nvoice={}\nbattery={}\nconsumption={}\nnav={}\ncalls={}\nnotif={}\nrate={}\nmuted={}\nslots={}\ntotal_km={}\ntotal_kwh={}\ndash_calls={}\nmoped_color={}\nappearance={}\ncontrast={}\nlanguage={}\n{}",
             flag(self.update_auto),
             self.update_checked_on,
-            flag(self.natural_voice),
+            self.voice_engine.code(),
             self.ccu_id,
             self.passkey,
             self.address,
@@ -366,7 +392,9 @@ impl Settings {
                 }
                 "contrast" => s.high_contrast = on,
                 "dash_calls" => s.dash_calls = on,
-                "natural_voice" => s.natural_voice = on,
+                // Before 0.6 there was only an on/off switch, on unless the rider turned it off.
+                "natural_voice" => s.voice_engine = if on { VoiceEngine::Auto } else { VoiceEngine::System },
+                "voice_engine" => s.voice_engine = VoiceEngine::from_code(value),
                 "update_auto" => s.update_auto = on,
                 "update_checked" => s.update_checked_on = value.to_string(),
                 "moped_color" => {
@@ -668,7 +696,7 @@ impl Engine {
 
     pub fn on_bluetooth(&mut self, state: BluetoothState) {
         if state == BluetoothState::Off && self.bluetooth == BluetoothState::On && self.has_pairing() {
-            self.say(t("Bluetooth is off."), true);
+            self.say_anyway(t("Bluetooth is off."), true);
         }
         self.bluetooth = state;
     }
@@ -722,13 +750,24 @@ impl Engine {
         c
     }
 
+    /// Ride speech: directions, battery, limits, notifications. The rider only hears it while the moped is
+    /// connected (or on the demo ride), so the phone stays quiet in a pocket off the moped.
     fn say(&mut self, text: impl Into<String>, urgent: bool) {
-        let text = text.into();
+        let riding = self.link == Link::Online || self.demo_active;
+        self.speak_logged(text.into(), urgent, riding);
+    }
+
+    /// Speech about the link itself, or something the rider asked for: it's spoken even when the moped isn't connected.
+    fn say_anyway(&mut self, text: impl Into<String>, urgent: bool) {
+        self.speak_logged(text.into(), urgent, true);
+    }
+
+    fn speak_logged(&mut self, text: String, urgent: bool, allowed: bool) {
         self.spoken.push_front(text.clone());
         self.spoken.truncate(LOG_LENGTH);
         // During a call only what can't wait is spoken over it.
         let on_a_call = self.call == CallState::OffHook;
-        if self.settings.voice_mode && (urgent || !on_a_call) {
+        if allowed && self.settings.voice_mode && (urgent || !on_a_call) {
             self.push(Command::Speak { text, urgent });
         }
     }
@@ -827,7 +866,7 @@ impl Engine {
                 // Usually the moped was switched off. Don't hunt for it: wait quietly until it's back.
                 self.wait_for_moped();
                 if was_online && self.switched_on_said != Some(false) {
-                    self.say(t("Moped connection lost."), true);
+                    self.say_anyway(t("Moped connection lost."), true);
                 }
             }
             _ => {}
@@ -865,7 +904,7 @@ impl Engine {
                 let retrying = self.reconnecting;
                 self.reconnecting = false;
                 self.set_link(Link::Refused);
-                self.say(t("The moped refused the pairing code."), true);
+                self.say_anyway(t("The moped refused the pairing code."), true);
                 self.push(Command::Disconnect);
                 if retrying {
                     self.connect();
@@ -987,15 +1026,15 @@ impl Engine {
         self.push(Command::VoiceRemove);
     }
 
-    pub fn set_natural_voice(&mut self, on: bool) {
-        self.settings.natural_voice = on;
+    pub fn set_voice_engine(&mut self, engine: VoiceEngine) {
+        self.settings.voice_engine = engine;
         self.save_settings();
-        self.push(Command::VoiceNatural(on));
+        self.push(Command::VoiceEngine(engine));
     }
 
     pub fn on_voice_pack(&mut self, state: VoicePack) {
         self.voice_pack = state;
-        self.push(Command::VoiceNatural(self.settings.natural_voice));
+        self.push(Command::VoiceEngine(self.settings.voice_engine));
     }
 
     // ----- Map pictures -----
@@ -1778,7 +1817,7 @@ impl Engine {
         self.save_settings();
         if on {
             let text = self.status_report();
-            self.say(tf("Voice mode on. {}", &[&text]), true);
+            self.say_anyway(tf("Voice mode on. {}", &[&text]), true);
         }
     }
 
@@ -1836,12 +1875,12 @@ impl Engine {
         if !self.settings.voice_mode {
             self.snack = Some(t("Speaking is off. Turn it on to hear this.").to_string());
         }
-        self.say(text, true);
+        self.say_anyway(text, true);
     }
 
     pub fn repeat_last(&mut self) {
         if let Some(text) = self.spoken.front().cloned() {
-            self.say(text, true);
+            self.say_anyway(text, true);
         }
     }
 
@@ -2412,6 +2451,42 @@ mod tests {
         e.on_notification("a.b", "Chat", "Sam", "Hello", false);
         assert!(speech(&mut e).is_empty());
         assert_eq!(e.spoken.len(), 1);
+    }
+
+    #[test]
+    fn voice_engine_setting_survives_and_old_switch_migrates() {
+        assert_eq!(Settings::from_text("natural_voice=1").voice_engine, VoiceEngine::Auto);
+        assert_eq!(Settings::from_text("natural_voice=0").voice_engine, VoiceEngine::System);
+        let s = Settings { voice_engine: VoiceEngine::Natural, ..Settings::default() };
+        assert_eq!(Settings::from_text(&s.to_text()).voice_engine, VoiceEngine::Natural);
+    }
+
+    #[test]
+    fn quiet_when_the_moped_is_not_connected() {
+        let mut e = online();
+        e.on_ble_disconnected();
+        assert_eq!(speech(&mut e), vec![t("Moped connection lost.").to_string()]);
+        e.on_notification("a.b", "Chat", "Sam", "Hello", false);
+        assert!(speech(&mut e).is_empty());
+        // Still logged, so Repeat and the log work.
+        assert!(e.spoken.iter().any(|s| s.contains("Sam")));
+    }
+
+    #[test]
+    fn asked_for_status_is_spoken_even_off_the_moped() {
+        let mut e = Engine::new();
+        e.settings.voice_mode = true;
+        e.speak_status();
+        assert_eq!(speech(&mut e).len(), 1);
+    }
+
+    #[test]
+    fn demo_ride_speaks_without_a_moped() {
+        let mut e = Engine::new();
+        e.settings.voice_mode = true;
+        e.start_demo();
+        e.on_notification("a.b", "Chat", "Sam", "Hello", false);
+        assert!(speech(&mut e).iter().any(|s| s.contains("Sam")));
     }
 
     #[test]
