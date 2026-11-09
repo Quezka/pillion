@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.5.1] - 2026-11-09
+
+- The suite's new shared look (0.5.0 didn't build: its licence notices were out of date).
+
 ## [0.6.0] - 2026-11-09
 
 - Pick the voice on the Voice tab: "Best" (the phone's own voice when it's a good one, such as Google's, otherwise the
