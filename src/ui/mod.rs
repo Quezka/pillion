@@ -1,6 +1,7 @@
 //! The phone screens, in the suite's Material 3 look. All of them read from and act on the shared `Engine`.
 
 
+mod glass;
 mod map;
 pub mod m3;
 pub mod model3d;
@@ -284,13 +285,21 @@ impl CompanionApp {
             if self.screen == Screen::Settings && m3::icon_button(ui, th, "arrow-back", th.text) {
                 self.go_to(ui, self.last_tab);
             }
-            ui.label(text(heading, 28.0, th.text, Weight::Bold));
+            // The chip and the gear keep their room; the title gets the rest, shrinking or cut short to fit.
+            let (name, color) = link_status(engine, th);
+            let width = ui.available_width();
+            let chip_room = (width * 0.42).min(190.0);
+            let gear_room = if self.screen != Screen::Settings { 52.0 } else { 0.0 };
+            let chip_width = (m3::fit(ui, name, 12.5, 11.0, Weight::SemiBold, color, chip_room - 32.0).size().x + 32.0).min(chip_room);
+            let title_room = (width - chip_width - gear_room - 12.0).max(40.0);
+            let title = m3::fit(ui, heading, 28.0, 19.0, Weight::Bold, th.text, title_room);
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(title_room, 52.0), Sense::hover());
+            ui.painter().galley(Pos2::new(rect.left(), rect.center().y - title.size().y / 2.0), title, th.text);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if self.screen != Screen::Settings && m3::icon_button(ui, th, "settings", th.muted) {
                     self.go_to(ui, Screen::Settings);
                 }
-                let (name, color) = link_status(engine, th);
-                m3::status_chip(ui, name, color);
+                m3::status_chip(ui, name, color, chip_room);
             });
         });
         if is_connecting(engine) {
@@ -621,20 +630,11 @@ impl CompanionApp {
         }
         let square = Rect::from_center_size(rect.center() - Vec2::new(0.0, 40.0), Vec2::splat(38.0));
         icon(&painter, square, "voice", true, th.on_accent);
-        painter.text(
-            rect.center() + Vec2::new(0.0, 8.0),
-            Align2::CENTER_CENTER,
-            t("Tell me how things are"),
-            FontId::new(21.0, Weight::Bold.family()),
-            th.on_accent,
-        );
-        painter.text(
-            rect.center() + Vec2::new(0.0, 40.0),
-            Align2::CENTER_CENTER,
-            t("Tap here, or press your earpiece's button"),
-            FontId::new(13.5, Weight::Medium.family()),
-            th.on_accent,
-        );
+        let room = rect.width() - 32.0;
+        let heading = m3::fit(ui, t("Tell me how things are"), 21.0, 16.0, Weight::Bold, th.on_accent, room);
+        painter.galley(rect.center() + Vec2::new(0.0, 8.0) - heading.size() / 2.0, heading, th.on_accent);
+        let hint = m3::fit(ui, t("Tap here, or press your earpiece's button"), 13.5, 11.0, Weight::Medium, th.on_accent, room);
+        painter.galley(rect.center() + Vec2::new(0.0, 40.0) - hint.size() / 2.0, hint, th.on_accent);
         if response.clicked() {
             engine.speak_status();
         }
@@ -859,7 +859,8 @@ impl CompanionApp {
             }
 
             let hint = rect.left_bottom() + Vec2::new(14.0, -14.0);
-            painter.text(hint, Align2::LEFT_BOTTOM, t("Drag to turn it. Pinch to zoom."), FontId::new(12.0, Weight::Medium.family()), th.faint);
+            let words = m3::fit(ui, t("Drag to turn it. Pinch to zoom."), 12.0, 10.0, Weight::Medium, th.faint, rect.width() - 28.0);
+            painter.galley(hint - Vec2::new(0.0, words.size().y), words, th.faint);
         });
         ui.add_space(10.0);
     }
@@ -1463,45 +1464,69 @@ impl eframe::App for CompanionApp {
 
         let scale = ctx.pixels_per_point();
         let (bar_top, bar_bottom) = engine.system_bars_px;
+        let screen = ctx.content_rect();
+        // On the Route tab the map fills the screen, under everything, and the bars over it are glass.
+        let on_map = self.screen == Screen::Route;
+        if on_map {
+            self.paint_map(&ctx, &mut engine, &th, screen);
+        }
+        let clear_frame = |fill: Color32| Frame::new().fill(if on_map { Color32::TRANSPARENT } else { fill });
         Panel::bottom("tabs")
-            .frame(Frame::new().fill(th.sidebar))
+            .frame(clear_frame(th.sidebar))
             .show_separator_line(false)
             .show(ui, |ui| {
+                let slot = ui.painter().add(egui::Shape::Noop);
                 self.nav_bar(ui, &th);
                 ui.add_space(bar_bottom / scale);
+                if on_map {
+                    let bar = Rect::from_min_max(Pos2::new(screen.left(), ui.min_rect().top()), screen.right_bottom());
+                    let glass = self.glass(&ctx, bar, 0.0, map::Pane::BottomBar, &mut engine, &th);
+                    ui.painter().set(slot, glass);
+                }
             });
         Panel::top("title")
-            .frame(Frame::new().fill(th.bg).inner_margin(Margin::symmetric(14, 4)))
+            .frame(clear_frame(th.bg).inner_margin(Margin::symmetric(14, 4)))
             .show_separator_line(false)
             .show(ui, |ui| {
+                let slot = ui.painter().add(egui::Shape::Noop);
                 ui.add_space(bar_top / scale);
                 self.top_bar(ui, &engine, &th);
+                if on_map {
+                    let bar = Rect::from_min_max(screen.left_top(), Pos2::new(screen.right(), ui.min_rect().bottom() + 4.0));
+                    let glass = self.glass(&ctx, bar, 0.0, map::Pane::TopBar, &mut engine, &th);
+                    ui.painter().set(slot, glass);
+                }
             });
         CentralPanel::default()
-            .frame(Frame::new().fill(th.bg).inner_margin(Margin::symmetric(14, 4)))
+            .frame(clear_frame(th.bg).inner_margin(Margin::symmetric(14, 4)))
             .show(ui, |ui| {
-                let area = ui.max_rect().expand2(Vec2::new(14.0, 4.0));
-                let age = ui.input(|i| i.time) - self.changed_screen_at;
-                let fading = self.changed_screen_at >= 0.0 && age < FADE_SECONDS;
-                if fading {
-                    ui.ctx().request_repaint();
-                }
-                ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let mut area = ui.max_rect().expand2(Vec2::new(14.0, 4.0));
+                if on_map {
+                    let room = self.route_screen(ui, &mut engine, &th);
+                    area.max.y = room.max.y;
+                } else {
+                    let age = ui.input(|i| i.time) - self.changed_screen_at;
+                    let fading = self.changed_screen_at >= 0.0 && age < FADE_SECONDS;
                     if fading {
-                        ui.set_opacity((age / FADE_SECONDS) as f32);
+                        ui.ctx().request_repaint();
                     }
-                    self.typed_prompt(ui, &mut engine, &th);
-                    Self::message_prompt(ui, &mut engine, &th);
-                    self.problems(ui, &mut engine, &th);
-                    match self.screen {
-                        Screen::Ride => self.ride_screen(ui, &mut engine, &th),
-                        Screen::Route => self.route_screen(ui, &mut engine, &th),
-                        Screen::Voice => Self::voice_screen(ui, &mut engine, &th),
-                        Screen::Moped => self.moped_screen(ui, &mut engine, &th),
-                        Screen::Alerts => Self::alerts_screen(ui, &mut engine, &th),
-                        Screen::Settings => Self::settings_screen(ui, &mut engine, &th),
-                    }
-                });
+                    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        if fading {
+                            ui.set_opacity((age / FADE_SECONDS) as f32);
+                        }
+                        self.typed_prompt(ui, &mut engine, &th);
+                        Self::message_prompt(ui, &mut engine, &th);
+                        self.problems(ui, &mut engine, &th);
+                        match self.screen {
+                            Screen::Ride => self.ride_screen(ui, &mut engine, &th),
+                            Screen::Route => {}
+                            Screen::Voice => Self::voice_screen(ui, &mut engine, &th),
+                            Screen::Moped => self.moped_screen(ui, &mut engine, &th),
+                            Screen::Alerts => Self::alerts_screen(ui, &mut engine, &th),
+                            Screen::Settings => Self::settings_screen(ui, &mut engine, &th),
+                        }
+                    });
+                }
                 self.overlays(ui, &mut engine, &th, area);
             });
         if m3::take_tap() {

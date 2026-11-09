@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{
-    Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Pos2, Rect, Response, RichText, Sense, Stroke,
+    Color32, CornerRadius, FontId, Frame, Id, Margin, Pos2, Rect, Response, RichText, Sense, Stroke,
     StrokeKind, Ui, Vec2,
 };
 
@@ -36,6 +36,29 @@ fn state_layer(ui: &Ui, response: &Response, rect: Rect, round: CornerRadius, in
     if amount > 0.0 {
         ui.painter_at(rect).rect_filled(rect, round, ink.gamma_multiply(0.14 * amount));
     }
+}
+
+/// Words on one line that fit `width`: the font shrinks a little first (down to `min_size`), then the end is cut
+/// with "…". Russian and Italian are often much longer than English, so everything drawn by hand goes through here.
+pub fn fit(ui: &Ui, value: &str, size: f32, min_size: f32, weight: Weight, ink: Color32, width: f32) -> std::sync::Arc<eframe::egui::Galley> {
+    let width = width.max(12.0);
+    let mut font_size = size;
+    loop {
+        let galley = ui.painter().layout_no_wrap(value.to_string(), FontId::new(font_size, weight.family()), ink);
+        if galley.size().x <= width {
+            return galley;
+        }
+        if font_size - 0.5 < min_size {
+            break;
+        }
+        font_size -= 0.5;
+    }
+    let mut job = eframe::egui::text::LayoutJob::single_section(
+        value.to_string(),
+        eframe::egui::TextFormat::simple(FontId::new(min_size, weight.family()), ink),
+    );
+    job.wrap = eframe::egui::text::TextWrapping { max_width: width, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+    ui.painter().layout_job(job)
 }
 
 pub fn text(value: impl Into<String>, size: f32, color: Color32, weight: Weight) -> RichText {
@@ -85,6 +108,18 @@ pub fn card(ui: &mut Ui, th: &Tokens, add: impl FnOnce(&mut Ui)) {
     ui.add_space(10.0);
 }
 
+/// A group of rows straight on glass (inside the Route tab's sheet): no card of its own, so the glass shows, with a
+/// hairline under it.
+pub fn section(ui: &mut Ui, th: &Tokens, add: impl FnOnce(&mut Ui)) {
+    Frame::new().inner_margin(Margin::symmetric(4, 6)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        add(ui);
+    });
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 9.0), Sense::hover());
+    ui.painter().hline(rect.x_range().shrink(6.0), rect.center().y, Stroke::new(1.0, th.text.gamma_multiply(0.10)));
+}
+
 /// A card in the primary container colour, for the one thing that matters most on a screen.
 pub fn hero(ui: &mut Ui, th: &Tokens, add: impl FnOnce(&mut Ui)) {
     card_frame(th, th.accent_soft).show(ui, |ui| {
@@ -92,14 +127,6 @@ pub fn hero(ui: &mut Ui, th: &Tokens, add: impl FnOnce(&mut Ui)) {
         add(ui);
     });
     ui.add_space(10.0);
-}
-
-/// A raised rounded panel painted straight onto the screen (the search bar). Glass over the map is `map::glass_button`.
-pub fn glass_panel(painter: &eframe::egui::Painter, rect: Rect, radius: u8, th: &Tokens) {
-    let round = CornerRadius::same(radius);
-    painter.rect_filled(rect, round, th.surface);
-    let edge = if th.outlined { Stroke::new(1.5, th.border) } else if th.glass { Stroke::new(1.0, th.glass_edge) } else { Stroke::NONE };
-    painter.rect_stroke(rect, round, edge, StrokeKind::Inside);
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -130,10 +157,13 @@ pub fn button(ui: &mut Ui, th: &Tokens, label: &str, glyph: Option<&'static str>
         painter.rect_stroke(rect, round, Stroke::new(1.2, th.border), StrokeKind::Inside);
     }
     state_layer(ui, &response, rect, round, ink);
-    let font = FontId::new(15.0, Weight::SemiBold.family());
-    let galley = painter.layout_no_wrap(label.to_string(), font, ink);
     const ICON: f32 = 20.0;
+    // The icon goes first when the words wouldn't fit beside it.
+    let room = rect.width() - 24.0;
+    let whole = fit(ui, label, 15.0, 15.0, Weight::SemiBold, ink, f32::INFINITY);
+    let glyph = glyph.filter(|_| whole.size().x + ICON + 8.0 <= room);
     let gap = if glyph.is_some() { ICON + 8.0 } else { 0.0 };
+    let galley = fit(ui, label, 15.0, 11.5, Weight::SemiBold, ink, room - gap);
     let start = rect.center().x - (galley.size().x + gap) / 2.0;
     if let Some(name) = glyph {
         let square = Rect::from_center_size(Pos2::new(start + ICON / 2.0, rect.center().y), Vec2::splat(ICON));
@@ -208,7 +238,7 @@ pub fn segmented(ui: &mut Ui, th: &Tokens, options: &[&str], selected: usize) ->
         let chosen = i == selected;
         let ink = if chosen { th.on_accent_soft } else { th.muted };
         let weight = if chosen { Weight::SemiBold } else { Weight::Medium };
-        let galley = painter.layout_no_wrap((*option).to_string(), FontId::new(13.5, weight.family()), ink);
+        let galley = fit(ui, option, 13.5, 11.0, weight, ink, width - 10.0);
         const TICK: f32 = 16.0;
         // A tick only when there's room for it next to the words.
         let ticked = chosen && galley.size().x + TICK + 12.0 < width;
@@ -227,9 +257,8 @@ pub fn segmented(ui: &mut Ui, th: &Tokens, options: &[&str], selected: usize) ->
 }
 
 /// A small status chip, with a dot of colour.
-pub fn status_chip(ui: &mut Ui, value: &str, color: Color32) {
-    let font = FontId::new(12.5, Weight::SemiBold.family());
-    let galley = ui.painter().layout_no_wrap(value.to_string(), font, color);
+pub fn status_chip(ui: &mut Ui, value: &str, color: Color32, max_width: f32) {
+    let galley = fit(ui, value, 12.5, 11.0, Weight::SemiBold, color, max_width - 32.0);
     let size = galley.size() + Vec2::new(32.0, 12.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter_at(rect);
@@ -400,21 +429,15 @@ pub fn nav_item(ui: &mut Ui, th: &Tokens, glyph: &'static str, name: &str, selec
     icon(&painter, Rect::from_center_size(centre, Vec2::splat(24.0)), glyph, selected, ink);
     let weight = if selected { Weight::Bold } else { Weight::Medium };
     let tint = if selected { th.text } else { th.muted };
-    painter.text(
-        Pos2::new(rect.center().x, rect.top() + 52.0),
-        Align2::CENTER_CENTER,
-        name,
-        FontId::new(12.0, weight.family()),
-        tint,
-    );
+    let galley = fit(ui, name, 12.0, 9.5, weight, tint, rect.width() - 4.0);
+    painter.galley(Pos2::new(rect.center().x, rect.top() + 52.0) - galley.size() / 2.0, galley, tint);
     tap(&response)
 }
 
 /// A large floating action, at a place already worked out.
 pub fn extended_fab(ui: &mut Ui, th: &Tokens, id: Id, right_bottom: Pos2, glyph: &'static str, name: &str) -> bool {
-    let font = FontId::new(15.5, Weight::SemiBold.family());
     let painter = ui.painter().clone();
-    let galley = painter.layout_no_wrap(name.to_string(), font, th.on_accent_soft);
+    let galley = fit(ui, name, 15.5, 12.0, Weight::SemiBold, th.on_accent_soft, ui.clip_rect().width() * 0.6);
     let size = Vec2::new(galley.size().x + 60.0, 58.0);
     let rect = Rect::from_min_max(right_bottom - size, right_bottom);
     let response = ui.interact(rect, id, Sense::click());

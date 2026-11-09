@@ -15,11 +15,16 @@ fn main() -> eframe::Result {
     let mut screenshot = None;
     let mut tab = None;
     let mut appearance = None;
+    let mut language = None;
+    let mut width = PHONE_SIZE[0];
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--screenshot" => screenshot = args.next(),
             "--tab" => tab = args.next(),
             "--appearance" => appearance = args.next(),
+            // To check every language fits, and on narrow phones (360 points is common).
+            "--language" => language = args.next(),
+            "--width" => width = args.next().and_then(|w| w.parse().ok()).unwrap_or(width),
             _ => {}
         }
     }
@@ -36,6 +41,12 @@ fn main() -> eframe::Result {
         match appearance.as_deref() {
             Some("light") => e.settings.appearance = Appearance::Light,
             Some("dark") => e.settings.appearance = Appearance::Dark,
+            _ => {}
+        }
+        match language.as_deref() {
+            Some("en") => e.settings.language = Some(pillion::locale::Lang::En),
+            Some("it") => e.settings.language = Some(pillion::locale::Lang::It),
+            Some("ru") => e.settings.language = Some(pillion::locale::Lang::Ru),
             _ => {}
         }
     }
@@ -56,7 +67,7 @@ fn main() -> eframe::Result {
         glow_options: eframe::egui_glow::GlowConfiguration { vsync: wait_for_refresh, ..Default::default() },
         viewport: egui::ViewportBuilder::default()
             .with_title("Pillion (preview)")
-            .with_inner_size(PHONE_SIZE)
+            .with_inner_size([width, PHONE_SIZE[1]])
             .with_resizable(false),
         ..Default::default()
     };

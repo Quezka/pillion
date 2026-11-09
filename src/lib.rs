@@ -32,10 +32,50 @@ pub fn desktop_prompts(engine: &mut Engine) -> Vec<(String, String)> {
             Command::AskText { key, title, .. } => prompts.push((key, title)),
             // There's no camera on the preview, so the code gets typed.
             Command::ScanQr { title, .. } => prompts.push(("pair".to_string(), title)),
+            Command::FetchTile { z, x, y } => preview_tiles::fetch(z, x, y),
             _ => {}
         }
     }
+    for (key, path) in preview_tiles::arrived() {
+        match path {
+            Some(path) => engine.on_tile(key, &path),
+            None => engine.on_tile_failed(key),
+        }
+    }
     prompts
+}
+
+/// The desktop preview's map pictures: fetched with `curl` on a worker thread into a cache folder, so the Route tab
+/// can be checked on a computer. The phone does this in Java.
+#[cfg(not(target_os = "android"))]
+mod preview_tiles {
+    use std::sync::Mutex;
+
+    type Arrival = ((u8, u32, u32), Option<String>);
+    static ARRIVED: Mutex<Vec<Arrival>> = Mutex::new(Vec::new());
+
+    pub fn fetch(z: u8, x: u32, y: u32) {
+        std::thread::spawn(move || {
+            let folder = std::env::temp_dir().join("pillion-preview-tiles");
+            let _ = std::fs::create_dir_all(&folder);
+            let file = folder.join(format!("{z}-{x}-{y}.png"));
+            let ok = file.exists()
+                || std::process::Command::new("curl")
+                    .args(["-sfL", "-A", "Pillion-preview (github.com/Quezka/pillion)", "-o"])
+                    .arg(&file)
+                    .arg(format!("https://tile.openstreetmap.org/{z}/{x}/{y}.png"))
+                    .status()
+                    .is_ok_and(|s| s.success());
+            let path = ok.then(|| file.to_string_lossy().into_owned());
+            if let Ok(mut list) = ARRIVED.lock() {
+                list.push(((z, x, y), path));
+            }
+        });
+    }
+
+    pub fn arrived() -> Vec<Arrival> {
+        ARRIVED.lock().map(|mut list| std::mem::take(&mut *list)).unwrap_or_default()
+    }
 }
 
 /// On a phone the Java side carries out commands, so the screen has nothing to do here.

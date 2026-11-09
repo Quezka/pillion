@@ -238,6 +238,7 @@ const MESSAGES: &[(&str, &str, &str)] = &[
     ("{} to go, {} min", "mancano {}, {} min", "осталось {}, {} мин"),
     ("Lights on the moped's dash", "Spie sul cruscotto del motorino", "Индикаторы на панели мопеда"),
     ("Coming up", "Più avanti", "Далее"),
+    ("Stop", "Ferma", "Стоп"),
     ("Stop navigation", "Ferma la navigazione", "Остановить навигацию"),
     ("Nowhere yet", "Ancora nessun posto", "Пока никуда"),
     ("Search for an address or a place. Places you've been will wait here for a quick start.", "Cerca un indirizzo o un luogo. I posti già visti resteranno qui per ripartire al volo.", "Найдите адрес или место. Посещённые места останутся здесь для быстрого старта."),

@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.0] - 2026-11-09
+
+- The Route tab is a full-screen map, and everything over it is liquid glass: the title bar, the tabs, the search bar
+  or the next turn, the map's buttons and a sheet with your places along the bottom. The map shows through all of
+  them, blurred, and they're more see-through than before. Tap the sheet's heading to open or fold it; it opens by
+  itself for search results and a picked spot, and Stop is always one tap away while navigating.
+- Words fit the screen in every language: titles, tab names, buttons and hints shrink a little or end with "…"
+  instead of running off the edge or under other things (checked in Italian and Russian on narrow phones).
+
 ## [0.3.1] - 2026-11-09
 
 - Liquid glass done properly, the Apple way: backgrounds are plain and cards solid again (the colour wash is gone),
