@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.8.0] - 2026-11-14
+
+- **Start by itself** can be switched off in Settings (it's on by default).
+- The "Glass look" switch is gone: the suite's look is Material 3 without glass.
+
 ## [0.7.0] - 2026-11-14
 
 - **Starts on its own.** After the phone switches on, after an update, when Bluetooth comes on or a Bluetooth device

@@ -71,6 +71,7 @@ fn encode(command: Command) -> String {
         Command::Share(text) => vec!["share".into(), text],
         Command::OpenNotificationAccess => vec!["notif_access".into()],
         Command::SetLanguage(code) => vec!["lang".into(), code.into()],
+        Command::SetAutostart(on) => vec!["autostart".into(), u8::from(on).to_string()],
         Command::EnableBluetooth => vec!["bt_enable".into()],
         Command::OpenLocationSettings => vec!["location_settings".into()],
         Command::OpenAppSettings => vec!["app_settings".into()],

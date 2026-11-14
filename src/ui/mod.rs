@@ -1303,11 +1303,6 @@ impl CompanionApp {
                 engine.save_settings();
             }
             ui.add_space(6.0);
-            let glass = engine.settings.glass;
-            if m3::switch_row(ui, th, t("Glass look"), glass) {
-                engine.settings.glass = !glass;
-                engine.save_settings();
-            }
             let high = engine.settings.high_contrast;
             if m3::switch_row(ui, th, t("High contrast"), high) {
                 engine.settings.high_contrast = !high;
@@ -1324,6 +1319,13 @@ impl CompanionApp {
             }
             ui.add_space(8.0);
             m3::small(ui, th, t("Spoken directions follow this too."));
+        });
+        m3::card(ui, th, |ui| {
+            let on = engine.settings.autostart;
+            if m3::switch_row(ui, th, t("Start by itself"), on) {
+                engine.set_autostart(!on);
+            }
+            m3::small(ui, th, t("After the phone switches on or Bluetooth comes on, Pillion waits for the moped in the background."));
         });
         Self::updates_card(ui, engine, th);
         m3::card(ui, th, |ui| {

@@ -307,6 +307,8 @@ const MESSAGES: &[(&str, &str, &str)] = &[
     ("Light", "Chiaro", "Светлое"),
     ("Dark", "Scuro", "Тёмное"),
     ("High contrast", "Contrasto elevato", "Высокая контрастность"),
+    ("Start by itself", "Avvio automatico", "Запускаться само"),
+    ("After the phone switches on or Bluetooth comes on, Pillion waits for the moped in the background.", "Quando accendi il telefono o il Bluetooth, Pillion aspetta lo scooter in background.", "Когда включается телефон или Bluetooth, Pillion ждёт скутер в фоне."),
     ("Language", "Lingua", "Язык"),
     ("Spoken directions follow this too.", "Anche le indicazioni a voce la seguono.", "Голосовые подсказки тоже следуют этой настройке."),
     ("Version {}", "Versione {}", "Версия {}"),

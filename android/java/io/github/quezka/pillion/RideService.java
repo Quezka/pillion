@@ -355,6 +355,9 @@ public class RideService extends Service {
             case "ask":
                 MainActivity.askText(f[1], f[2], f[3], "1".equals(f[4]));
                 break;
+            case "autostart":
+                getSharedPreferences("pillion", MODE_PRIVATE).edit().putBoolean("autostart", "1".equals(f[1])).apply();
+                break;
             case "haptic":
                 MainActivity.haptic();
                 break;

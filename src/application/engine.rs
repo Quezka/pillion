@@ -91,6 +91,8 @@ pub enum Command {
     EnableBluetooth,
     OpenLocationSettings,
     OpenAppSettings,
+    /// Start by itself (after boot, update, Bluetooth on): Android keeps this in its own preferences.
+    SetAutostart(bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,6 +264,8 @@ pub struct Settings {
     pub warn_speeding: bool,
     /// The glass look (see-through surfaces over a soft wash of colour).
     pub glass: bool,
+    /// Start by itself and wait for the moped (Android's boot and Bluetooth broadcasts).
+    pub autostart: bool,
 }
 
 impl Default for Settings {
@@ -294,6 +298,7 @@ impl Default for Settings {
             say_limits: true,
             warn_speeding: true,
             glass: true,
+            autostart: true,
         }
     }
 }
@@ -347,7 +352,7 @@ impl Settings {
                     "bookmark={};{};{};{}\n",
                     b.kind.code(), b.place.at.0, b.place.at.1, b.place.full_name().replace('\n', " ")
                 )))
-                .chain([format!("limits={}\nspeeding={}\nglass={}\n", flag(self.say_limits), flag(self.warn_speeding), flag(self.glass))])
+                .chain([format!("limits={}\nspeeding={}\nglass={}\nautostart={}\n", flag(self.say_limits), flag(self.warn_speeding), flag(self.glass), flag(self.autostart))])
                 .collect::<String>(),
         )
     }
@@ -425,6 +430,7 @@ impl Settings {
                 "limits" => s.say_limits = on,
                 "speeding" => s.warn_speeding = on,
                 "glass" => s.glass = on,
+                "autostart" => s.autostart = on,
                 _ => {}
             }
         }
@@ -1810,6 +1816,12 @@ impl Engine {
 
     pub fn open_notification_access(&mut self) {
         self.push(Command::OpenNotificationAccess);
+    }
+
+    pub fn set_autostart(&mut self, on: bool) {
+        self.settings.autostart = on;
+        self.save_settings();
+        self.push(Command::SetAutostart(on));
     }
 
     pub fn set_voice_mode(&mut self, on: bool) {
