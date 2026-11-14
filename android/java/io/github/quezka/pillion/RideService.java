@@ -141,7 +141,7 @@ public class RideService extends Service {
             started = true;
             begin();
         }
-        return START_NOT_STICKY;
+        return START_STICKY; // autonomous: android restart it after a kill
     }
 
     private void begin() {

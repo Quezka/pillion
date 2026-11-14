@@ -41,14 +41,14 @@ const fn hex(rgb: u32) -> Color32 {
 }
 
 pub const LIGHT: Tokens = Tokens {
-    bg: hex(0xf4f4f2),
+    bg: hex(0xf7f7fb),
     surface: hex(0xffffff),
-    raised: hex(0xebebe8),
-    sidebar: hex(0xeeeeeb),
-    border: hex(0xb4b4ae),
-    text: hex(0x111111),
-    muted: hex(0x3c3c39),
-    faint: hex(0x52524e),
+    raised: hex(0xeaeaf2),
+    sidebar: hex(0xf7f7fb),
+    border: hex(0xb6b6c4),
+    text: hex(0x111116),
+    muted: hex(0x3d3d46),
+    faint: hex(0x5b5b66),
     accent: hex(0x4f46e5),
     accent_soft: hex(0xe3e2fb),
     on_accent: hex(0xffffff),
@@ -58,20 +58,20 @@ pub const LIGHT: Tokens = Tokens {
     warning: hex(0xb45309),
     outlined: false,
     dark: false,
-    glass: true,
+    glass: false, // m3 tonal 2026-11-14: user rm glass -> solid panes
     glass_edge: Color32::from_rgba_premultiplied(235, 235, 235, 235),
     glow: hex(0xec4899),
 };
 
 pub const DARK: Tokens = Tokens {
-    bg: hex(0x111112),
-    surface: hex(0x1c1c1e),
-    raised: hex(0x2a2a2d),
-    sidebar: hex(0x161618),
-    border: hex(0x4b4b50),
-    text: hex(0xf5f5f4),
-    muted: hex(0xd0d0cc),
-    faint: hex(0xa9a9a5),
+    bg: hex(0x121218),
+    surface: hex(0x1d1d24),
+    raised: hex(0x2a2a33),
+    sidebar: hex(0x121218),
+    border: hex(0x4a4a56),
+    text: hex(0xf8f7fc),
+    muted: hex(0xcfcfd9),
+    faint: hex(0xa8a8b4),
     accent: hex(0xa9a6ff),
     accent_soft: hex(0x37356e),
     on_accent: hex(0x0b0b14),
@@ -81,7 +81,7 @@ pub const DARK: Tokens = Tokens {
     warning: hex(0xfbbf24),
     outlined: false,
     dark: true,
-    glass: true,
+    glass: false, // m3 tonal 2026-11-14
     glass_edge: Color32::from_rgba_premultiplied(40, 40, 40, 40),
     glow: hex(0xec4899),
 };
@@ -263,8 +263,8 @@ mod tests {
     fn colours_are_the_kits() {
         // The suite tokens (suite-rs/design/tokens.json, written here by tools/gen_tokens.py).
         assert_eq!(LIGHT.accent, Color32::from_rgb(0x4f, 0x46, 0xe5));
-        assert!(LIGHT.glass && !tokens(false, true).glass);
-        assert_eq!(DARK.bg, Color32::from_rgb(0x11, 0x11, 0x12));
+        assert!(!LIGHT.glass && !DARK.glass); // material 3 tonal: no glass (2026-11-14)
+        assert_eq!(DARK.bg, Color32::from_rgb(0x12, 0x12, 0x18));
         assert!(tokens(true, true).outlined);
         assert!(!tokens(false, false).dark);
     }

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0] - 2026-11-14
+
+- **Starts on its own.** After the phone switches on, after an update, when Bluetooth comes on or a Bluetooth device
+  connects, Pillion starts in the background and waits for the moped: no need to open it first. If Android stops it, it
+  comes back. The Stop button in its notification still stops it (until the next of those moments).
+- The suite's new Material 3 tonal look: solid panels over the map instead of glass, darker text.
+
 ## [0.6.1] - 2026-11-09
 
 - Brings 0.5.0 (the suite's new shared look) and 0.6.0 (pick the voice, quiet off the moped) to phones: neither built, because the licence notices were out of date.
