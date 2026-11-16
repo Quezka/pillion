@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.10.0] - 2026-11-16
+
+- **Range calculator** (Moped tab › Range): set how far you're going, and whether it's there and back, to see if the battery gets you there with charge to spare and how much you'll have left on arrival. It also says how long to charge for the trip. With the moped off, set the charge yourself.
+- **App names on the Alerts tab** instead of package ids (like `com.whatsapp`) on Android 11 and newer.
+
 ## [0.9.0] - 2026-11-16
 
 - **Easier to read:** bigger text everywhere; hints are darker and no smaller than 14 px; buttons and choices don't shrink their words as far.

@@ -46,7 +46,7 @@ public class NotificationWatcher extends NotificationListenerService {
         boolean call = Notification.CATEGORY_CALL.equals(n.category);
         Native.event("notif",
                 posted.getPackageName(),
-                label(posted.getPackageName()),
+                label(posted.getPackageName(), posted.getNotification()),
                 Objects.toString(title, ""),
                 Objects.toString(text, ""),
                 call ? "1" : "0");
@@ -62,8 +62,19 @@ public class NotificationWatcher extends NotificationListenerService {
         Native.event("notif_gone", removed.getPackageName());
     }
 
-    private String label(String packageName) {
+    /** The app's name, not its package id. Android 11+ hides other apps from the package manager unless
+     *  the manifest asks to see them, but every notification carries its app's info: use that first. */
+    private String label(String packageName, android.app.Notification notification) {
         PackageManager packages = getPackageManager();
+        if (notification != null) {
+            ApplicationInfo carried = notification.extras.getParcelable("android.appInfo");
+            if (carried != null) {
+                CharSequence name = carried.loadLabel(packages);
+                if (name != null && name.length() > 0 && !name.toString().equals(packageName)) {
+                    return name.toString();
+                }
+            }
+        }
         try {
             ApplicationInfo info = packages.getApplicationInfo(packageName, 0);
             return packages.getApplicationLabel(info).toString();
