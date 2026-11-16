@@ -4,4 +4,5 @@
 pub mod geo;
 pub mod places;
 pub mod protocol;
+pub mod range;
 pub mod speed_limit;

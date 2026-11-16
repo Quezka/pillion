@@ -58,12 +58,20 @@ enum Screen {
     Settings,
 }
 
+/// What the range calculator was given (kept while the app runs).
+struct RangeInputs {
+    percent: f64,
+    distance_km: f64,
+    round_trip: bool,
+}
+
 /// The part of the moped being looked at.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Batteries,
     Motor,
     Dash,
+    Range,
 }
 
 impl Focus {
@@ -73,6 +81,7 @@ impl Focus {
             Self::Batteries => (0.62, 0.52),
             Self::Motor => (-0.42, 0.14),
             Self::Dash => (2.45, 0.42),
+            Self::Range => (0.62, 0.52),
         }
     }
 }
@@ -136,6 +145,7 @@ pub struct CompanionApp {
     changed_screen_at: f64,
     snack: Option<(String, f64)>,
     model: ModelView,
+    range: RangeInputs,
     map: map::MapView,
 }
 
@@ -240,6 +250,7 @@ impl CompanionApp {
             changed_screen_at: -1.0,
             snack: None,
             model: ModelView::new(),
+            range: RangeInputs { percent: 80.0, distance_km: 0.0, round_trip: false },
             map: map::MapView::default(),
         }
     }
@@ -907,9 +918,9 @@ impl CompanionApp {
             }
         });
         ui.add_space(8.0);
-        let focuses = [Focus::Batteries, Focus::Motor, Focus::Dash];
+        let focuses = [Focus::Batteries, Focus::Motor, Focus::Dash, Focus::Range];
         let selected = focuses.iter().position(|f| *f == self.model.focus).unwrap_or(0);
-        if let Some(i) = m3::segmented(ui, th, &[t("Batteries"), t("Motor"), t("Dash")], selected) {
+        if let Some(i) = m3::segmented(ui, th, &[t("Batteries"), t("Motor"), t("Dash"), t("Range")], selected) {
             self.model.select(focuses[i]);
         }
         ui.add_space(10.0);
@@ -920,10 +931,61 @@ impl CompanionApp {
                 Self::dash_panel(ui, engine, th);
                 Self::about_moped_card(ui, engine, th);
             }
+            Focus::Range => self.range_panel(ui, engine, th),
         }
         if engine.demo_active && m3::button(ui, th, t("End the demo ride"), Some("x"), Kind::Outlined, 48.0) {
             engine.stop_demo();
         }
+    }
+
+    /// Trip check + charge planner. Moped off -> rider sets the charge by hand.
+    fn range_panel(&mut self, ui: &mut Ui, engine: &Engine, th: &Tokens) {
+        use crate::domain::range::{charge_minutes, percent_for_km, trip_check};
+        let live_percent = engine.percent().map(f64::from);
+        let r = &mut self.range;
+        if let Some(p) = live_percent { r.percent = p; }
+        let km_per_percent = engine.full_range_km().map(|full| full / 100.0)
+            .unwrap_or(engine.efficiency() * crate::application::engine::NOMINAL_PACK_AH * crate::application::engine::AVG_PACK_VOLTAGE / 1000.0 / 100.0);
+        let range_km = engine.range_km().unwrap_or(km_per_percent * r.percent);
+        if let Some(nav) = &engine.nav {
+            if r.distance_km == 0.0 { r.distance_km = (nav.remaining_m() / 1000.0).round(); }
+        }
+        m3::card(ui, th, |ui| {
+            m3::title(ui, th, t("Will I make it?"));
+            if live_percent.is_none() {
+                m3::small(ui, th, t("Moped off: set the charge yourself."));
+                ui.add(egui::Slider::new(&mut r.percent, 5.0..=100.0).suffix(" %").step_by(1.0));
+            }
+            m3::small(ui, th, t("Distance"));
+            ui.add(egui::Slider::new(&mut r.distance_km, 0.0..=120.0).suffix(" km").step_by(1.0));
+            if m3::switch_row(ui, th, t("There and back"), r.round_trip) { r.round_trip = !r.round_trip; }
+            if let Some(c) = trip_check(r.percent, range_km, r.distance_km, r.round_trip) {
+                let (ink, verdict) = if c.ok { (th.success, t("Yes, with charge to spare")) }
+                    else if c.arrive_percent > 0.0 { (th.warning, t("Only just: little charge left")) }
+                    else { (th.danger, t("No: charge first")) };
+                ui.label(m3::text(verdict, 22.0, ink, Weight::Bold));
+                m3::stat_row(ui, th, &[
+                    (tf("{} km", &[&format!("{:.0}", c.needed_km)]), t("to ride")),
+                    (tf("{} %", &[&format!("{:.0}", c.arrive_percent.max(0.0))]), t("left on arrival")),
+                ]);
+            }
+        });
+        ui.add_space(10.0);
+        m3::card(ui, th, |ui| {
+            m3::title(ui, th, t("Charge for a trip"));
+            let need = percent_for_km(r.distance_km * if r.round_trip { 2.0 } else { 1.0 }, km_per_percent * 100.0).unwrap_or(100.0);
+            let health = engine.live.as_ref().and_then(|l| l.packs.iter().find(|p| p.fitted)).map(|p| p.health).unwrap_or(100);
+            let full_hours = Engine::charge_hours(0, health);
+            let minutes = charge_minutes(r.percent, need, full_hours);
+            if minutes <= 0.0 {
+                m3::body(ui, th, t("No need to charge for this trip."));
+            } else {
+                m3::stat_row(ui, th, &[
+                    (tf("{} %", &[&format!("{:.0}", need)]), t("charge to")),
+                    (tf("{} h {} min", &[&(minutes as i64 / 60), &(minutes as i64 % 60)]), t("on the charger")),
+                ]);
+            }
+        });
     }
 
     fn batteries_panel(ui: &mut Ui, engine: &Engine, th: &Tokens) {
