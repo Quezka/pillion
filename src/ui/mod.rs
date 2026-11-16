@@ -672,7 +672,19 @@ impl CompanionApp {
         });
         m3::card(ui, th, |ui| {
             m3::label(ui, th, t("What to tell me about"));
+            // folded: one line saying what's on; "Change" opens the six switches
+            let open_id = eframe::egui::Id::NULL.with("pillion-voice-what-open");
+            let open = ui.data(|d| d.get_temp::<bool>(open_id).unwrap_or(false));
             let s = &mut engine.settings;
+            let on = [s.say_battery, s.say_consumption, s.say_navigation, s.say_limits, s.warn_speeding, s.say_calls]
+                .iter().filter(|v| **v).count();
+            if !open {
+                m3::body(ui, th, &tf("{} of 6 on", &[&on]));
+                if m3::button(ui, th, t("Change"), None, Kind::Tonal, 44.0) {
+                    ui.data_mut(|d| d.insert_temp(open_id, true));
+                }
+                return;
+            }
             let mut changed = false;
             let choices = [
                 (t("Battery and range"), &mut s.say_battery),
@@ -692,6 +704,9 @@ impl CompanionApp {
             m3::small(ui, th, t("Warnings are always spoken. During a call, only directions and warnings are."));
             if changed {
                 engine.save_settings();
+            }
+            if m3::button(ui, th, t("Done"), None, Kind::Text, 44.0) {
+                ui.data_mut(|d| d.insert_temp(open_id, false));
             }
         });
         m3::card(ui, th, |ui| {
@@ -876,9 +891,8 @@ impl CompanionApp {
     }
 
     fn moped_screen(&mut self, ui: &mut Ui, engine: &mut Engine, th: &Tokens) {
-        if engine.link != Link::Online || engine.demo_active {
-            Self::connection_card(ui, engine, th, &mut self.confirm_forget);
-        }
+        // always on top: the same place whether online or not (it used to jump to the bottom once connected)
+        Self::connection_card(ui, engine, th, &mut self.confirm_forget);
         self.model_card(ui, engine, th);
         ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 38.0), Layout::left_to_right(Align::Center), |ui| {
             let color = engine.settings.moped_color;
@@ -906,9 +920,6 @@ impl CompanionApp {
                 Self::dash_panel(ui, engine, th);
                 Self::about_moped_card(ui, engine, th);
             }
-        }
-        if !engine.demo_active && engine.link == Link::Online {
-            Self::connection_card(ui, engine, th, &mut self.confirm_forget);
         }
         if engine.demo_active && m3::button(ui, th, t("End the demo ride"), Some("x"), Kind::Outlined, 48.0) {
             engine.stop_demo();
@@ -1203,13 +1214,23 @@ impl CompanionApp {
                 engine.settings.dash_calls = !calls;
                 engine.save_settings();
             }
+            // first 5 apps, the rest folded (a long list of switches is hard to scan)
             let apps = engine.apps.clone();
-            for app in apps {
+            let open_id = eframe::egui::Id::NULL.with("pillion-alerts-all-apps");
+            let all = ui.data(|d| d.get_temp::<bool>(open_id).unwrap_or(false));
+            let shown = if all { apps.len() } else { apps.len().min(5) };
+            for app in apps.iter().take(shown) {
                 let muted = engine.settings.muted_apps.contains(&app.package);
                 let slot = engine.settings.dash_slots.iter().position(|p| *p == app.package);
                 let light = slot.map_or(t("no light").to_string(), |s| tf("light {}", &[&(s + 1)]));
                 if m3::switch_row(ui, th, &format!("{} ({light})", app.label), !muted) {
                     engine.toggle_app_muted(&app.package);
+                }
+            }
+            if apps.len() > 5 {
+                let label = if all { t("Show fewer").to_string() } else { tf("Show all ({})", &[&apps.len()]) };
+                if m3::button(ui, th, &label, None, Kind::Text, 44.0) {
+                    ui.data_mut(|d| d.insert_temp(open_id, !all));
                 }
             }
             ui.add_space(4.0);
@@ -1314,7 +1335,7 @@ impl CompanionApp {
             let choices = [None, Some(Lang::En), Some(Lang::It), Some(Lang::Ru)];
             let selected = choices.iter().position(|c| *c == engine.settings.language).unwrap_or(0);
             // Each language is written in itself, so it can be found from any of them.
-            if let Some(i) = m3::segmented(ui, th, &[t("System"), "English", "Italiano", "Русский"], selected) {
+            if let Some(i) = m3::choice_rows(ui, th, &[t("System"), "English", "Italiano", "Русский"], selected) {
                 engine.set_language(choices[i]);
             }
             ui.add_space(8.0);
@@ -1343,7 +1364,8 @@ impl CompanionApp {
     }
 
     fn nav_bar(&mut self, ui: &mut Ui, th: &Tokens) {
-        let current = if self.screen == Screen::Settings { self.last_tab } else { self.screen };
+        // in Settings no tab is lit: Settings isn't one of them (it opens from the gear)
+        let current = self.screen;
         ui.add_space(4.0);
         let mut chosen = None;
         ui.columns(5, |c| {

@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.9.0] - 2026-11-16
+
+- **Easier to read:** bigger text everywhere; hints are darker and no smaller than 14 px; buttons and choices don't shrink their words as far.
+- **Language** is a list now, one language per row, instead of four squeezed into one bar.
+- **Voice:** "What to tell me about" shows how many are on; its six switches open with Change.
+- **Alerts:** only the first five apps show, the rest fold behind "Show all".
+- **Moped:** the connection card stays at the top, connected or not.
+- In Settings no tab is lit any more (Settings isn't one of them).
+
 ## [0.8.1] - 2026-11-15
 
 - **New icon**, drawn like every other Quezka app: the same rounded square in its own plain colour with a white symbol.

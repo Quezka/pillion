@@ -66,23 +66,23 @@ pub fn text(value: impl Into<String>, size: f32, color: Color32, weight: Weight)
 }
 
 pub fn headline(ui: &mut Ui, th: &Tokens, value: &str) {
-    ui.label(text(value, 20.0, th.text, Weight::Bold));
+    ui.label(text(value, 22.0, th.text, Weight::Bold));
 }
 
 pub fn title(ui: &mut Ui, th: &Tokens, value: &str) {
-    ui.label(text(value, 15.5, th.text, Weight::SemiBold));
+    ui.label(text(value, 17.0, th.text, Weight::SemiBold));
 }
 
 pub fn body(ui: &mut Ui, th: &Tokens, value: &str) {
-    ui.label(text(value, 14.0, th.muted, Weight::Regular));
+    ui.label(text(value, 15.5, th.muted, Weight::Regular));
 }
 
 pub fn small(ui: &mut Ui, th: &Tokens, value: &str) {
-    ui.label(text(value, 12.0, th.faint, Weight::Regular));
+    ui.label(text(value, 14.0, th.muted, Weight::Regular));
 }
 
 pub fn label(ui: &mut Ui, th: &Tokens, value: &str) {
-    ui.label(text(value, 13.0, th.accent, Weight::SemiBold));
+    ui.label(text(value, 14.5, th.accent, Weight::SemiBold));
     ui.add_space(6.0);
 }
 
@@ -163,7 +163,7 @@ pub fn button(ui: &mut Ui, th: &Tokens, label: &str, glyph: Option<&'static str>
     let whole = fit(ui, label, 15.0, 15.0, Weight::SemiBold, ink, f32::INFINITY);
     let glyph = glyph.filter(|_| whole.size().x + ICON + 8.0 <= room);
     let gap = if glyph.is_some() { ICON + 8.0 } else { 0.0 };
-    let galley = fit(ui, label, 15.0, 11.5, Weight::SemiBold, ink, room - gap);
+    let galley = fit(ui, label, 15.0, 13.0, Weight::SemiBold, ink, room - gap);
     let start = rect.center().x - (galley.size().x + gap) / 2.0;
     if let Some(name) = glyph {
         let square = Rect::from_center_size(Pos2::new(start + ICON / 2.0, rect.center().y), Vec2::splat(ICON));
@@ -238,7 +238,7 @@ pub fn segmented(ui: &mut Ui, th: &Tokens, options: &[&str], selected: usize) ->
         let chosen = i == selected;
         let ink = if chosen { th.on_accent_soft } else { th.muted };
         let weight = if chosen { Weight::SemiBold } else { Weight::Medium };
-        let galley = fit(ui, option, 13.5, 11.0, weight, ink, width - 10.0);
+        let galley = fit(ui, option, 15.0, 12.5, weight, ink, width - 10.0);
         const TICK: f32 = 16.0;
         // A tick only when there's room for it next to the words.
         let ticked = chosen && galley.size().x + TICK + 12.0 < width;
@@ -258,7 +258,7 @@ pub fn segmented(ui: &mut Ui, th: &Tokens, options: &[&str], selected: usize) ->
 
 /// A small status chip, with a dot of colour.
 pub fn status_chip(ui: &mut Ui, value: &str, color: Color32, max_width: f32) {
-    let galley = fit(ui, value, 12.5, 11.0, Weight::SemiBold, color, max_width - 32.0);
+    let galley = fit(ui, value, 13.5, 12.0, Weight::SemiBold, color, max_width - 32.0);
     let size = galley.size() + Vec2::new(32.0, 12.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter_at(rect);
@@ -429,7 +429,7 @@ pub fn nav_item(ui: &mut Ui, th: &Tokens, glyph: &'static str, name: &str, selec
     icon(&painter, Rect::from_center_size(centre, Vec2::splat(24.0)), glyph, selected, ink);
     let weight = if selected { Weight::Bold } else { Weight::Medium };
     let tint = if selected { th.text } else { th.muted };
-    let galley = fit(ui, name, 12.0, 9.5, weight, tint, rect.width() - 4.0);
+    let galley = fit(ui, name, 13.0, 11.0, weight, tint, rect.width() - 4.0);
     painter.galley(Pos2::new(rect.center().x, rect.top() + 52.0) - galley.size() / 2.0, galley, tint);
     tap(&response)
 }
@@ -470,3 +470,31 @@ pub fn snackbar(ui: &Ui, th: &Tokens, area: Rect, message: &str, opacity: f32) {
     painter.galley(rect.min + Vec2::new(16.0, 13.0), galley, ink.gamma_multiply(opacity));
 }
 
+
+/// One choice per row (a list, not a crowded segmented bar): whole row tappable, a tick on the chosen one.
+/// For choices whose names are long or many (languages).
+pub fn choice_rows(ui: &mut Ui, th: &Tokens, options: &[&str], selected: usize) -> Option<usize> {
+    let mut tapped = None;
+    for (i, option) in options.iter().enumerate() {
+        let width = ui.available_width();
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 52.0), Sense::click());
+        let chosen = i == selected;
+        let painter = ui.painter_at(rect);
+        let round = CornerRadius::same(14);
+        if chosen {
+            painter.rect_filled(rect, round, th.accent_soft);
+        }
+        state_layer(ui, &response, rect, round, th.text);
+        let ink = if chosen { th.on_accent_soft } else { th.text };
+        let galley = fit(ui, option, 16.0, 13.0, if chosen { Weight::SemiBold } else { Weight::Medium }, ink, width - 64.0);
+        painter.galley(Pos2::new(rect.left() + 16.0, rect.center().y - galley.size().y / 2.0), galley, ink);
+        if chosen {
+            let square = Rect::from_center_size(Pos2::new(rect.right() - 26.0, rect.center().y), Vec2::splat(22.0));
+            icon(&painter, square, "check", false, ink);
+        }
+        if tap(&response) {
+            tapped = Some(i);
+        }
+    }
+    tapped
+}
